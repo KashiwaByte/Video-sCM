@@ -1,0 +1,9 @@
+[project]
+name = "video-sana-sprint"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "diffusers>=0.32.2",
+]
