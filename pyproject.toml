@@ -6,4 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "diffusers>=0.32.2",
+    "matplotlib>=3.10.1",
+    "mmcv==1.7.2",
+    "swanlab>=0.5.3",
+    "transformers>=4.50.1",
+    "wandb>=0.19.8",
+    "webdataset>=0.2.111",
 ]
