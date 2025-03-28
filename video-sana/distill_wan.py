@@ -32,8 +32,6 @@ current_file_path = os.path.abspath(__file__)
 current_dir = os.path.dirname(current_file_path)
 # 获取父目录路径
 parent_dir = os.path.dirname(current_dir)
-
-
 # 将祖父目录添加到 sys.path 中
 sys.path.append(parent_dir)
 
@@ -49,8 +47,6 @@ from fastvideo.utils.load import load_transformer
 from fastvideo.utils.parallel_states import (destroy_sequence_parallel_group, get_sequence_parallel_state,
                                              initialize_sequence_parallel_state)
 from fastvideo.utils.validation import log_validation
-
-from Wan.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.31.0")
@@ -147,13 +143,7 @@ def distill_one_step(
         # pdb.set_trace()
         
         
-        # sample_scheduler = FlowUniPCMultistepScheduler(
-        # num_train_timesteps=1000,
-        # shift=1,
-        # use_dynamic_shifting=False)
-        # sample_scheduler.set_timesteps(
-        #     50, device="cuda", shift=5.0)
-        # timesteps = sample_scheduler.timesteps
+
         
         
         noisy_model_input =sigmas * noise + (1.0 - sigmas) * model_input
@@ -612,6 +602,75 @@ if __name__ == "__main__":
 
     parser.add_argument("--model_type", type=str, default="wan", help="The type of model to train.")
 
+    # Scheduler
+    parser.add_argument('--predict_flow_v', type=bool, default=True,
+                   help='Enable flow velocity prediction')
+    parser.add_argument('--noise_schedule', type=str, default='linear_flow',
+                    help='Type of noise schedule')
+    parser.add_argument('--pred_sigma', type=bool, default=False,
+                    help='Enable sigma prediction')
+    parser.add_argument('--weighting_scheme', type=str, default='logit_normal_trigflow',
+                    help='Weighting scheme for timesteps')
+    parser.add_argument('--logit_mean', type=float, default=0.2,
+                    help='Mean for logit-normal distribution')
+    parser.add_argument('--logit_std', type=float, default=1.6,
+                    help='Standard deviation for logit-normal distribution')
+    parser.add_argument('--logit_mean_discriminator', type=float, default=-0.6,
+                    help='Mean for discriminator logit-normal distribution')
+    parser.add_argument('--logit_std_discriminator', type=float, default=1.0,
+                    help='Standard deviation for discriminator logit-normal distribution')
+    parser.add_argument('--sigma_data', type=float, default=0.5,
+                    help='Sigma value for data')
+    parser.add_argument('--vis_sampler', type=str, default='scm',
+                    help='Visualization sampler type')
+    parser.add_argument('--timestep_norm_scale_factor', type=int, default=1000,
+                    help='Scale factor for timestep normalization')
+    
+    
+    # sCM
+    parser.add_argument("--logvar",type=bool, default=True, help="Whether to use log variance in sCM.")
+    parser.add_argument('--class_dropout_prob', type=float, default=0.0,
+                   help='Probability of class dropout during training')
+    parser.add_argument('--cfg_scale', type=float, default=5.0,
+                    help='Configuration scale factor')
+    parser.add_argument('--cfg_embed', type=bool, default=True,
+                    help='Whether to use configuration embedding')
+    parser.add_argument('--cfg_embed_scale', type=float, default=0.1,
+                    help='Scale factor for configuration embedding')
+    
+    # sCM   training arguments
+    parser.add_argument('--tangent_warmup_steps', type=int, default=4000,
+                   help='Number of warmup steps for tangent learning')
+    parser.add_argument('--scm_cfg_scale', type=float, nargs='+', default=[4.0, 4.5, 5.0],
+                    help='Configuration scale values for sCM')
+    
+    
+    
+    # LADD config
+    parser.add_argument('--ladd_multi_scale', type=bool, default=True,
+                   help='Enable multi-scale feature for LADD')
+    parser.add_argument('--head_block_ids', type=int, nargs='+', default=[2, 8, 14, 19],
+                   help='Block IDs for head layers')
+    
+    # LADD training arguments
+    parser.add_argument('--adv_lambda', type=float, default=0.5,
+                   help='Weight for adversarial loss')
+    parser.add_argument('--scm_lambda', type=float, default=1.0,
+                    help='Weight for SCM loss')
+    parser.add_argument('--scm_loss', type=bool, default=True,
+                    help='Enable SCM loss')
+    parser.add_argument('--misaligned_pairs_D', type=bool, default=True,
+                    help='Enable misaligned pairs for discriminator')
+    parser.add_argument('--discriminator_loss', type=str, default='hinge',
+                    help='Type of discriminator loss')
+    parser.add_argument('--train_largest_timestep', type=bool, default=True,
+                    help='Enable training with largest timestep')
+    parser.add_argument('--largest_timestep', type=float, default=1.57080,
+                    help='Value of largest timestep')
+    parser.add_argument('--largest_timestep_prob', type=float, default=0.5,
+                    help='Probability of using largest timestep')
+    
+    
     # dataset & dataloader
     parser.add_argument("--data_json_path", type=str , default= "/storage/lintaoLab/lintao/botehuang/datasets/webvid-10k/Image-Vid-wan/videos2caption.json")
     parser.add_argument("--num_height", type=int, default=480)
