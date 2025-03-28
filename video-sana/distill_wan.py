@@ -150,8 +150,7 @@ def distill_one_step(
         print(f"0shape{noisy_model_input.shape}")
         # noisy_model_input = model_input
         # print(f"noisy_input:{noisy_model_input.shape}")      
-        
-        
+            
         target_shape = (16, 
                         21,
                         60,
@@ -175,7 +174,6 @@ def distill_one_step(
                                                             device=noisy_model_input.device,
                                                             dtype=torch.bfloat16)
                 
-     
             model_pred = transformer(**teacher_kwargs)[0]
 
         # if accelerator.is_main_process:

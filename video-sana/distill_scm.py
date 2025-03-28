@@ -13,7 +13,6 @@ import torch
 import torch.distributed as dist
 import swanlab
 from accelerate.utils import set_seed
-from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from peft import LoraConfig
@@ -32,15 +31,11 @@ current_file_path = os.path.abspath(__file__)
 current_dir = os.path.dirname(current_file_path)
 # 获取父目录路径
 parent_dir = os.path.dirname(current_dir)
-
-
 # 将祖父目录添加到 sys.path 中
 sys.path.append(parent_dir)
 
 from fastvideo.dataset.latent_datasets import (LatentDataset, latent_collate_function)
-from fastvideo.distill.solver import EulerSolver, extract_into_tensor
 from fastvideo.models.mochi_hf.mochi_latents_utils import normalize_dit_input
-from fastvideo.models.mochi_hf.pipeline_mochi import linear_quadratic_schedule
 from fastvideo.utils.checkpoint import (resume_lora_optimizer, save_checkpoint, save_lora_checkpoint)
 from fastvideo.utils.communications import (broadcast, sp_parallel_dataloader_wrapper)
 from fastvideo.utils.dataset_utils import LengthGroupedSampler
@@ -50,7 +45,8 @@ from fastvideo.utils.parallel_states import (destroy_sequence_parallel_group, ge
                                              initialize_sequence_parallel_state)
 from fastvideo.utils.validation import log_validation
 
-from Wan.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
+from diffusion import SCMScheduler
+from diffusion.model.respace import compute_density_for_timestep_sampling
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.31.0")
@@ -87,25 +83,17 @@ def distill_one_step(
     transformer,
     model_type,
     teacher_transformer,
-    ema_transformer,
     optimizer,
     lr_scheduler,
     loader,
     noise_scheduler,
-    solver,
-    noise_random_generator,
     gradient_accumulation_steps,
     sp_size,
     max_grad_norm,
     uncond_prompt_embed,
     uncond_prompt_mask,
-    num_euler_timesteps,
-    multiphase,
     not_apply_cfg_solver,
     distill_cfg,
-    ema_decay,
-    pred_decay_weight,
-    pred_decay_type,
     hunyuan_teacher_disable_cfg,
 ):
     total_loss = 0.0
@@ -123,143 +111,126 @@ def distill_one_step(
             latents_attention_mask,
             encoder_attention_mask,
         ) = next(loader)
-        print(f"latents:{latents.shape}") 
-        # latents = latents.squeeze(0)
-        print(f"latentsN:{latents.shape}") 
+        sigma_data=args.sigma_data
         model_input = normalize_dit_input(model_type, latents)
-        noise = torch.randn_like(model_input)
-        print(f"噪声的shape是{model_input.shape}")
+        noise = torch.randn_like(model_input)*sigma_data
         bsz = model_input.shape[0]
-        index = torch.randint(0, num_euler_timesteps, (bsz, ), device=model_input.device).long()
-        if sp_size > 1:
-            broadcast(index)
-        # Add noise according to flow matching.
-        # sigmas = get_sigmas(start_timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
-        sigmas = extract_into_tensor(solver.sigmas, index, model_input.shape)
-        sigmas_prev = extract_into_tensor(solver.sigmas_prev, index, model_input.shape)
-  
-        timesteps = (sigmas * noise_scheduler.config.num_train_timesteps).view(-1)
-        # if squeeze to [], unsqueeze to [1]
         
-        timesteps_prev = (sigmas_prev * noise_scheduler.config.num_train_timesteps).view(-1)
-        
-        print(f"input:{model_input.shape}")        
-        # pdb.set_trace()
-        
-        
-        # sample_scheduler = FlowUniPCMultistepScheduler(
-        # num_train_timesteps=1000,
-        # shift=1,
-        # use_dynamic_shifting=False)
-        # sample_scheduler.set_timesteps(
-        #     50, device="cuda", shift=5.0)
-        # timesteps = sample_scheduler.timesteps
-        
-        
-        noisy_model_input =sigmas * noise + (1.0 - sigmas) * model_input
-        print(f"0shape{noisy_model_input.shape}")
-        # noisy_model_input = model_input
-        # print(f"noisy_input:{noisy_model_input.shape}")      
-        
-        
-        target_shape = (16, 
-                        21,
-                        60,
-                        104)
-        patch_size = (1, 2, 2)
-
-        seq_len = math.ceil((target_shape[2] * target_shape[3]) /
-                            (patch_size[1] * patch_size[2]) *
-                            target_shape[1] / sp_size) * sp_size
-        
-        # Predict the noise residual
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            teacher_kwargs = {
-                "x": noisy_model_input,
-                "context": encoder_hidden_states,
-                "t": timesteps,
-                "seq_len": seq_len
-            }
-            if hunyuan_teacher_disable_cfg:
-                teacher_kwargs["guidance"] = torch.tensor([1000.0],
-                                                            device=noisy_model_input.device,
-                                                            dtype=torch.bfloat16)
+        # Sample timesteps for SCM training
+        if args.weighting_scheme == "logit_normal_trigflow":
+            u = compute_density_for_timestep_sampling(
+                weighting_scheme=args.weighting_scheme,
+                batch_size=bsz,
+                logit_mean=args.logit_mean,
+                logit_std=args.logit_std,
+                mode_scale=None,
+            )
+            timesteps = u.float().to(model_input.device)
+        elif args.weighting_scheme == "logit_normal_trigflow_ladd":
+            indices = torch.randint(0, len(args.add_noise_timesteps), (bsz,))
+            u = torch.tensor([args.add_noise_timesteps[i] for i in indices])
+            if len(args.add_noise_timesteps) == 1:
+                # zero-SNR
+                timesteps = torch.tensor([1.57080 for i in indices]).float().to(model_input.device)
+            else:
+                timesteps = u.float().to(model_input.device)
+        else:
+            # Default random sampling
+            timesteps = torch.rand(bsz, device=model_input.device) * 1.57080  # pi/2
                 
-     
-            model_pred = transformer(**teacher_kwargs)[0]
-
-        # if accelerator.is_main_process:
-        model_pred, end_index = solver.euler_style_multiphase_pred(noisy_model_input, model_pred, index, multiphase)
-        with torch.no_grad():
-            w = distill_cfg
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                cond_teacher_output = teacher_transformer(
-                    **teacher_kwargs
-                )[0].float()
-            if not_apply_cfg_solver:
-                uncond_teacher_output = cond_teacher_output
-            else:
-                # Get teacher model prediction on noisy_latents and unconditional embedding
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    uncond_teacher_output = teacher_transformer(
-                            **teacher_kwargs        
-                    )[0].float()
-            teacher_output = uncond_teacher_output + w * (cond_teacher_output - uncond_teacher_output)
-            x_prev = solver.euler_step(noisy_model_input, teacher_output, index)
-
-        # 20.4.12. Get target LCM prediction on x_prev, w, c, t_n
-        with torch.no_grad():
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                if ema_transformer is not None:
-                    target_pred = ema_transformer(
-                        x_prev.float(),
-                        encoder_hidden_states,
-                        timesteps_prev,
-                        encoder_attention_mask,  # B, L
-                    )[0]
-                else:  
-                    target_pred = transformer(
-                        x = x_prev.float(),
-                        context = encoder_hidden_states,
-                        t = timesteps_prev,
-                        seq_len = seq_len
-                    )[0]
-                    # target_pred = transformer(**teacher_kwargs)[0]
-
-            target, end_index = solver.euler_style_multiphase_pred(x_prev, target_pred, index, multiphase, True)
-        # pdb.set_trace()
-        huber_c = 0.001  
-        # loss = loss.mean()
-        loss = (torch.mean(torch.sqrt((model_pred.float() - target.float())**2 + huber_c**2) - huber_c) /
-                gradient_accumulation_steps)
-        if pred_decay_weight > 0:
-            if pred_decay_type == "l1":
-                pred_decay_loss = (torch.mean(torch.sqrt(model_pred.float()**2)) * pred_decay_weight /
-                                   gradient_accumulation_steps)
-                loss += pred_decay_loss
-            elif pred_decay_type == "l2":
-                # essnetially k2?
-                pred_decay_loss = (torch.mean(model_pred.float()**2) * pred_decay_weight / gradient_accumulation_steps)
-                loss += pred_decay_loss
-            else:
-                assert NotImplementedError("pred_decay_type is not implemented")
-
+        t = timesteps.view(-1, 1, 1, 1)
         
-        # calculate model_pred norm and mean
-        get_norm(model_pred.detach().float(), model_pred_norm, gradient_accumulation_steps)
-        loss.backward()
+        # Add noise according to SCM
+        z = torch.randn_like(model_input) * sigma_data
+        x_t = torch.cos(t) * model_input + torch.sin(t) * z
+        
+        
+        def model_wrapper(scaled_x_t, t):
+            pred, logvar = transformer(
+                x=scaled_x_t, context=encoder_hidden_states, t=t.flatten(), seq_len=seq_len, return_logvar=True, jvp=True
+            )
+            return pred, logvar
+        
+        target_shape = (16, 21, 60, 104)
+        patch_size = (1, 2, 2)
+        seq_len = math.ceil((target_shape[2] * target_shape[3]) /
+                          (patch_size[1] * patch_size[2]) *
+                          target_shape[1] / sp_size) * sp_size
+        
+        # Predict using transformer
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            model_kwargs = {
+                "x": x_t / sigma_data,
+                "context": encoder_hidden_states,
+                "t": t.flatten(),
+                "seq_len": seq_len,
+                "return_logvar": True,
+                "jvp": True
+            }
+            
+            # Calculate v_x and v_t for jvp
+            pretrain_pred = teacher_transformer(**model_kwargs)[0]
+            dxt_dt = sigma_data * pretrain_pred
+            v_x = torch.cos(t) * torch.sin(t) * dxt_dt / sigma_data
+            v_t = torch.cos(t) * torch.sin(t)
+            
+            # Calculate F_theta using jvp
+            F_theta, F_theta_grad, logvar = torch.func.jvp(
+                            model_wrapper, (x_t / sigma_data, t), (v_x, v_t), has_aux=True
+                        )
+            
+            F_theta, logvar = transformer(
+                x=x_t / sigma_data,
+                context=encoder_hidden_states,
+                t=t.flatten(),
+                seq_len=seq_len,
+                return_logvar=True,
+                jvp=False
+            )
+            
+            logvar = logvar.view(-1, 1, 1, 1)
+            F_theta_grad = F_theta_grad.detach()
+            F_theta_minus = F_theta.detach()
+            
+            # Calculate gradient g using JVP rearrangement
+            g = -torch.cos(t) * torch.cos(t) * (sigma_data * F_theta_minus - dxt_dt)
+            
+            # Warmup steps
+            r = min(1, global_step / args.tangent_warmup_steps)
+            second_term = -r * (torch.cos(t) * torch.sin(t) * x_t + sigma_data * F_theta_grad)
+            g = g + second_term
+            
+            # Tangent normalization
+            g_norm = torch.linalg.vector_norm(g, dim=(1, 2, 3), keepdim=True)
+            g = g / (g_norm + 0.1)  # 0.1 is the constant c
+            
+            # Calculate loss with weight and logvar
+            sigma = torch.tan(t) * sigma_data
+            weight = 1 / sigma
+            l2_loss = torch.square(F_theta - F_theta_minus - g)
+            
+            # Calculate loss with normalization factor
+            loss = (weight / torch.exp(logvar)) * l2_loss + logvar
+            loss = loss.mean() / gradient_accumulation_steps
+            
+            
+            loss_no_logvar = weight * torch.square(F_theta - F_theta_minus - g)
+            loss_no_logvar = loss_no_logvar.mean()
+            loss_no_weight = l2_loss.mean()
+            g_norm = g_norm.mean()
+            
+        
+        pred_x_0 = torch.cos(t_G) * x_t - torch.sin(t_G) * F_theta * sigma_data
 
-       
+        # Calculate model prediction norms
+        get_norm(F_theta.detach().float(), model_pred_norm, gradient_accumulation_steps)
+        loss.backward()
+        
         avg_loss = loss.detach().clone()
         dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
         total_loss += avg_loss.item()
 
-    # update ema
-    if ema_transformer is not None:
-        reshard_fsdp(ema_transformer)
-        for p_averaged, p_model in zip(ema_transformer.parameters(), transformer.parameters()):
-            with torch.no_grad():
-                p_averaged.copy_(torch.lerp(p_averaged.detach(), p_model.detach(), 1 - ema_decay))
+
    
     grad_norm = clip_grad.clip_grad_norm_(transformer.parameters(), max_grad_norm)
     optimizer.step()
@@ -279,21 +250,12 @@ def main(args):
     device = torch.cuda.current_device()
     initialize_sequence_parallel_state(args.sp_size)
 
-    # If passed along, set the training seed now. On GPU...
     if args.seed is not None:
-        # TODO: t within the same seq parallel group should be the same. Noise should be different.
         set_seed(args.seed + rank)
-    # We use different seeds for the noise generation in each process to ensure that the noise is different in a batch.
     noise_random_generator = None
 
-    # Handle the repository creation
     if rank <= 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
-
-    # For mixed precision training we cast all non-trainable weights to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-
-    # Create model:
 
     main_print(f"--> loading model from {args.pretrained_model_name_or_path}")
 
@@ -305,10 +267,7 @@ def main(args):
     )
 
     teacher_transformer = deepcopy(transformer)
-    if args.use_ema:
-        ema_transformer = deepcopy(transformer)
-    else:
-        ema_transformer = None
+
 
     if args.use_lora:
         assert args.model_type == "mochi", "LoRA is only supported for Mochi model."
@@ -339,7 +298,6 @@ def main(args):
         transformer._no_split_modules = no_split_modules
         fsdp_kwargs["auto_wrap_policy"] = fsdp_kwargs["auto_wrap_policy"](transformer)
 
-    # pdb.set_trace()
     transformer = FSDP(
         transformer,
         **fsdp_kwargs,
@@ -351,42 +309,21 @@ def main(args):
     
     transformer = transformer.cuda()
     teacher_transformer = teacher_transformer.cuda()
-    if args.use_ema:
-        ema_transformer = FSDP(
-            ema_transformer,
-            **fsdp_kwargs,
-        )
-    main_print("--> model loaded")
-    
 
+    main_print("--> model loaded")
 
     if args.gradient_checkpointing:
         apply_fsdp_checkpointing(transformer, no_split_modules, args.selective_checkpointing)
         apply_fsdp_checkpointing(teacher_transformer, no_split_modules, args.selective_checkpointing)
-        if args.use_ema:
-            apply_fsdp_checkpointing(ema_transformer, no_split_modules, args.selective_checkpointing)
-    # Set model as trainable.
+
+
     transformer.train()
     teacher_transformer.requires_grad_(False)
-    if args.use_ema:
-        ema_transformer.requires_grad_(False)
-    noise_scheduler = FlowMatchEulerDiscreteScheduler(shift=args.shift)
-    if args.scheduler_type == "pcm_linear_quadratic":
-        linear_steps = int(noise_scheduler.config.num_train_timesteps * args.linear_range)
-        sigmas = linear_quadratic_schedule(
-            noise_scheduler.config.num_train_timesteps,
-            args.linear_quadratic_threshold,
-            linear_steps,
-        )
-        sigmas = torch.tensor(sigmas).to(dtype=torch.float32)
-    else:
-        sigmas = noise_scheduler.sigmas
-    solver = EulerSolver(
-        sigmas.numpy()[::-1],
-        noise_scheduler.config.num_train_timesteps,
-        euler_timesteps=args.num_euler_timesteps,
-    )
-    solver.to(device)
+
+
+    # Initialize SCM scheduler
+    noise_scheduler = SCMScheduler()
+
     params_to_optimize = transformer.parameters()
     params_to_optimize = list(filter(lambda p: p.requires_grad, params_to_optimize))
 
@@ -404,7 +341,6 @@ def main(args):
                                                                    optimizer)
     main_print(f"optimizer: {optimizer}")
 
-    # todo add lr scheduler
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
@@ -445,7 +381,7 @@ def main(args):
     if rank <= 0:
         project = args.tracker_project_name or "fastvideo"
         swanlab.init(project='distill', config=args , mode='cloud',logdir="/storage/lintaoLab/lintao/botehuang")
-    # Train!
+
     total_batch_size = (world_size * args.gradient_accumulation_steps / args.sp_size * args.train_sp_batch_size)
     main_print("***** Running training *****")
     main_print(f"  Num examples = {len(train_dataset)}")
@@ -459,152 +395,74 @@ def main(args):
     main_print(
         f"  Total training parameters per FSDP shard = {sum(p.numel() for p in transformer.parameters() if p.requires_grad) / 1e9} B"
     )
-    # print dtype
     main_print(f"  Master weight dtype: {transformer.parameters().__next__().dtype}")
-
-    # Potentially load in the weights and states from a previous save
-    if args.resume_from_checkpoint:
-        assert NotImplementedError("resume_from_checkpoint is not supported now.")
-        # TODO
 
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=init_steps,
         desc="Steps",
-        # Only show the progress bar once on each machine.
-        disable=local_rank > 0,
+        disable=rank > 0,
     )
+    global_step = init_steps
 
-    loader = sp_parallel_dataloader_wrapper(
-        train_dataloader,
-        device,
-        args.train_batch_size,
-        args.sp_size,
-        args.train_sp_batch_size,
-    )
+    loader = sp_parallel_dataloader_wrapper(train_dataloader, args.sp_size)
 
-    step_times = deque(maxlen=100)
+    for epoch in range(args.num_train_epochs):
+        train_loss = 0.0
+        for step in range(num_update_steps_per_epoch):
+            # Skip steps for resuming
+            if global_step < init_steps:
+                progress_bar.update(1)
+                global_step += 1
+                continue
 
-    # todo future
-    for i in range(init_steps):
-        next(loader)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                loss, grad_norm, model_pred_norm = distill_one_step(
+                    transformer=transformer,
+                    model_type=args.model_type,
+                    teacher_transformer=teacher_transformer,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                    loader=loader,
+                    noise_scheduler=noise_scheduler,
+                    gradient_accumulation_steps=args.gradient_accumulation_steps,
+                    sp_size=args.sp_size,
+                    max_grad_norm=args.max_grad_norm,
+                    uncond_prompt_embed=uncond_prompt_embed,
+                    uncond_prompt_mask=uncond_prompt_mask,
+                    not_apply_cfg_solver=args.not_apply_cfg_solver,
+                    distill_cfg=args.distill_cfg,
 
-    # log_validation(args, transformer, device,
-    #             torch.bfloat16, 0, scheduler_type=args.scheduler_type, shift=args.shift, num_euler_timesteps=args.num_euler_timesteps, linear_quadratic_threshold=args.linear_quadratic_threshold,ema=False)
-    def get_num_phases(multi_phased_distill_schedule, step):
-        # step-phase,step-phase
-        multi_phases = multi_phased_distill_schedule.split(",")
-        phase = multi_phases[-1].split("-")[-1]
-        for step_phases in multi_phases:
-            phase_step, phase = step_phases.split("-")
-            if step <= int(phase_step):
-                return int(phase)
-        return phase
-
-    for step in range(init_steps + 1, args.max_train_steps + 1):
-        start_time = time.time()
-        assert args.multi_phased_distill_schedule is not None
-        num_phases = get_num_phases(args.multi_phased_distill_schedule, step)
-
-        loss, grad_norm, pred_norm = distill_one_step(
-            transformer,
-            args.model_type,
-            teacher_transformer,
-            ema_transformer,
-            optimizer,
-            lr_scheduler,
-            loader,
-            noise_scheduler,
-            solver,
-            noise_random_generator,
-            args.gradient_accumulation_steps,
-            args.sp_size,
-            args.max_grad_norm,
-            uncond_prompt_embed,
-            uncond_prompt_mask,
-            args.num_euler_timesteps,
-            num_phases,
-            args.not_apply_cfg_solver,
-            args.distill_cfg,
-            args.ema_decay,
-            args.pred_decay_weight,
-            args.pred_decay_type,
-            args.hunyuan_teacher_disable_cfg,
-        )
-
-        step_time = time.time() - start_time
-        step_times.append(step_time)
-        avg_step_time = sum(step_times) / len(step_times)
-
-        progress_bar.set_postfix({
-            "loss": f"{loss:.4f}",
-            "step_time": f"{step_time:.2f}s",
-            "grad_norm": grad_norm,
-            "phases": num_phases,
-        })
-        progress_bar.update(1)
-        if rank <= 0:
-            swanlab.log(
-               data = {
-                    "train_loss": loss,
-                    "learning_rate": lr_scheduler.get_last_lr()[0],
-                    "step_time": step_time,
-                    "avg_step_time": avg_step_time,
-                    "grad_norm": grad_norm,
-                    "pred_fro_norm": pred_norm["fro"],  # codespell:ignore
-                    "pred_largest_singular_value": pred_norm["largest singular value"],
-                    "pred_absolute_mean": pred_norm["absolute mean"],
-                    "pred_absolute_max": pred_norm["absolute max"],
-                },
-                step=step,
-            )
-        if step % args.checkpointing_steps == 0:
-            if args.use_lora:
-                # Save LoRA weights
-                save_lora_checkpoint(transformer, optimizer, rank, args.output_dir, step)
-            else:
-                # Your existing checkpoint saving code
-                if args.use_ema:
-                    save_checkpoint(ema_transformer, rank, args.output_dir, step)
-                else:
-                    save_checkpoint(transformer, rank, args.output_dir, step)
-            dist.barrier()
-        if args.log_validation and step % args.validation_steps == 0:
-            log_validation(
-                args,
-                transformer,
-                device,
-                torch.bfloat16,
-                step,
-                scheduler_type=args.scheduler_type,
-                shift=args.shift,
-                num_euler_timesteps=args.num_euler_timesteps,
-                linear_quadratic_threshold=args.linear_quadratic_threshold,
-                linear_range=args.linear_range,
-                ema=False,
-            )
-            if args.use_ema:
-                log_validation(
-                    args,
-                    ema_transformer,
-                    device,
-                    torch.bfloat16,
-                    step,
-                    scheduler_type=args.scheduler_type,
-                    shift=args.shift,
-                    num_euler_timesteps=args.num_euler_timesteps,
-                    linear_quadratic_threshold=args.linear_quadratic_threshold,
-                    linear_range=args.linear_range,
-                    ema=True,
+                    hunyuan_teacher_disable_cfg=args.hunyuan_teacher_disable_cfg,
                 )
 
-    if args.use_lora:
-        save_lora_checkpoint(transformer, optimizer, rank, args.output_dir, args.max_train_steps)
-    else:
-        save_checkpoint(transformer, rank, args.output_dir, args.max_train_steps)
+            train_loss += loss
 
-    if get_sequence_parallel_state():
-        destroy_sequence_parallel_group()
+            logs = {
+                "loss": loss,
+                "lr": lr_scheduler.get_last_lr()[0],
+                "grad_norm": grad_norm,
+                "step": global_step,
+            }
+            logs.update(model_pred_norm)
+            progress_bar.update(1)
+            progress_bar.set_postfix(**logs)
+
+            if rank <= 0:
+                swanlab.log(logs)
+
+            if args.use_lora and global_step % args.checkpointing_steps == 0:
+                if rank <= 0:
+                    save_lora_checkpoint(
+                        transformer,
+                        optimizer,
+                        args.output_dir,
+                        global_step,
+                    )
+
+            global_step += 1
+
+    destroy_sequence_parallel_group()
 
 
 if __name__ == "__main__":
@@ -612,6 +470,75 @@ if __name__ == "__main__":
 
     parser.add_argument("--model_type", type=str, default="wan", help="The type of model to train.")
 
+    # Scheduler
+    parser.add_argument('--predict_flow_v', type=bool, default=True,
+                   help='Enable flow velocity prediction')
+    parser.add_argument('--noise_schedule', type=str, default='linear_flow',
+                    help='Type of noise schedule')
+    parser.add_argument('--pred_sigma', type=bool, default=False,
+                    help='Enable sigma prediction')
+    parser.add_argument('--weighting_scheme', type=str, default='logit_normal_trigflow',
+                    help='Weighting scheme for timesteps')
+    parser.add_argument('--logit_mean', type=float, default=0.2,
+                    help='Mean for logit-normal distribution')
+    parser.add_argument('--logit_std', type=float, default=1.6,
+                    help='Standard deviation for logit-normal distribution')
+    parser.add_argument('--logit_mean_discriminator', type=float, default=-0.6,
+                    help='Mean for discriminator logit-normal distribution')
+    parser.add_argument('--logit_std_discriminator', type=float, default=1.0,
+                    help='Standard deviation for discriminator logit-normal distribution')
+    parser.add_argument('--sigma_data', type=float, default=0.5,
+                    help='Sigma value for data')
+    parser.add_argument('--vis_sampler', type=str, default='scm',
+                    help='Visualization sampler type')
+    parser.add_argument('--timestep_norm_scale_factor', type=int, default=1000,
+                    help='Scale factor for timestep normalization')
+    
+    
+    # sCM
+    parser.add_argument("--logvar",type=bool, default=True, help="Whether to use log variance in sCM.")
+    parser.add_argument('--class_dropout_prob', type=float, default=0.0,
+                   help='Probability of class dropout during training')
+    parser.add_argument('--cfg_scale', type=float, default=5.0,
+                    help='Configuration scale factor')
+    parser.add_argument('--cfg_embed', type=bool, default=True,
+                    help='Whether to use configuration embedding')
+    parser.add_argument('--cfg_embed_scale', type=float, default=0.1,
+                    help='Scale factor for configuration embedding')
+    
+    # sCM   training arguments
+    parser.add_argument('--tangent_warmup_steps', type=int, default=4000,
+                   help='Number of warmup steps for tangent learning')
+    parser.add_argument('--scm_cfg_scale', type=float, nargs='+', default=[4.0, 4.5, 5.0],
+                    help='Configuration scale values for sCM')
+    
+    
+    
+    # LADD config
+    parser.add_argument('--ladd_multi_scale', type=bool, default=True,
+                   help='Enable multi-scale feature for LADD')
+    parser.add_argument('--head_block_ids', type=int, nargs='+', default=[2, 8, 14, 19],
+                   help='Block IDs for head layers')
+    
+    # LADD training arguments
+    parser.add_argument('--adv_lambda', type=float, default=0.5,
+                   help='Weight for adversarial loss')
+    parser.add_argument('--scm_lambda', type=float, default=1.0,
+                    help='Weight for SCM loss')
+    parser.add_argument('--scm_loss', type=bool, default=True,
+                    help='Enable SCM loss')
+    parser.add_argument('--misaligned_pairs_D', type=bool, default=True,
+                    help='Enable misaligned pairs for discriminator')
+    parser.add_argument('--discriminator_loss', type=str, default='hinge',
+                    help='Type of discriminator loss')
+    parser.add_argument('--train_largest_timestep', type=bool, default=True,
+                    help='Enable training with largest timestep')
+    parser.add_argument('--largest_timestep', type=float, default=1.57080,
+                    help='Value of largest timestep')
+    parser.add_argument('--largest_timestep_prob', type=float, default=0.5,
+                    help='Probability of using largest timestep')
+    
+    
     # dataset & dataloader
     parser.add_argument("--data_json_path", type=str , default= "/storage/lintaoLab/lintao/botehuang/datasets/webvid-10k/Image-Vid-wan/videos2caption.json")
     parser.add_argument("--num_height", type=int, default=480)
@@ -639,8 +566,6 @@ if __name__ == "__main__":
     parser.add_argument("--cache_dir", type=str, default="./cache_dir")
 
     # diffusion setting
-    parser.add_argument("--ema_decay", type=float, default=0.95)
-    parser.add_argument("--ema_start_step", type=int, default=0)
     parser.add_argument("--cfg", type=float, default=0.1)
 
     # validation & logs
@@ -818,10 +743,7 @@ if __name__ == "__main__":
         help="Range for linear quadratic scheduler.",
     )
     parser.add_argument("--weight_decay", type=float, default=0.001, help="Weight decay to apply.")
-    parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA.")
     parser.add_argument("--multi_phased_distill_schedule", type=str, default="4000-1")
-    parser.add_argument("--pred_decay_weight", type=float, default=0.0)
-    parser.add_argument("--pred_decay_type", default="l1")
     parser.add_argument("--hunyuan_teacher_disable_cfg", action="store_true")
     parser.add_argument(
         "--master_weight_type",
