@@ -1,21 +1,46 @@
 import os
 from pathlib import Path
+import os
+import sys
+import torch
+from transformers import BertModel, BertTokenizer
+from diffusers import AutoencoderKLWan, WanPipeline
 
+
+
+# 获取当前脚本的文件路径
+current_file = __file__
+
+# 将祖父路径插入到 sys.path 中
+sys.path.insert(0, '/storage/lintaoLab/lintao/botehuang/diffusion')
+
+from Wan.wan.modules.model import WanModel,WanAttentionBlock
+from Wan.wan.modules.t5 import WanT5EncoderModel,T5EncoderModel,TestWanT5EncoderModel
+from Wan.wan.modules.vae import WanVAE
+from StepVideoT2V.stepvideo.modules.blocks import (
+        StepVideoTransformerBlock, 
+        PatchEmbed
+    )
+from StepVideoT2V.stepvideo.modules.model import StepVideoModel
+from StepVideoT2V.stepvideo.text_encoder.stepllm import STEP1TextEncoder
+from StepVideoT2V.stepvideo.text_encoder.clip import HunyuanClip
+from StepVideoT2V.stepvideo.vae.vae import AutoencoderKL
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKLHunyuanVideo, AutoencoderKLMochi, AutoencoderKLWan
+from diffusers import AutoencoderKLHunyuanVideo, AutoencoderKLMochi
 from torch import nn
 from transformers import AutoTokenizer, T5EncoderModel
 
-from fastvideo.models.hunyuan.modules.models import (HYVideoDiffusionTransformer, MMDoubleStreamBlock,
-                                                     MMSingleStreamBlock)
+from fastvideo.models.hunyuan.modules.models import (
+    HYVideoDiffusionTransformer, MMDoubleStreamBlock, MMSingleStreamBlock)
 from fastvideo.models.hunyuan.text_encoder import TextEncoder
-from fastvideo.models.hunyuan.vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
-from fastvideo.models.hunyuan_hf.modeling_hunyuan import (HunyuanVideoSingleTransformerBlock,
-                                                          HunyuanVideoTransformer3DModel, HunyuanVideoTransformerBlock)
-from fastvideo.models.mochi_hf.modeling_mochi import MochiTransformer3DModel, MochiTransformerBlock
-from Wan.wan.modules.model import WanModel, WanAttentionBlock
-from video_sana.models.scm_model.wan_scm import WanModelSCM
+from fastvideo.models.hunyuan.vae.autoencoder_kl_causal_3d import \
+    AutoencoderKLCausal3D
+from fastvideo.models.hunyuan_hf.modeling_hunyuan import (
+    HunyuanVideoSingleTransformerBlock, HunyuanVideoTransformer3DModel,
+    HunyuanVideoTransformerBlock)
+from fastvideo.models.mochi_hf.modeling_mochi import (MochiTransformer3DModel,
+                                                      MochiTransformerBlock)
 from fastvideo.utils.logging_ import main_print
 
 hunyuan_config = {
@@ -54,6 +79,69 @@ PROMPT_TEMPLATE = {
     },
 }
 
+class WanTextEncoderWrapper(nn.Module):
+    def __init__(self, checkpoint_dir):
+        super().__init__()
+        self.text_encoder = WanT5EncoderModel(
+        text_len=512,
+        dtype=torch.bfloat16,
+        device=torch.device('cpu'),
+        checkpoint_path=os.path.join(checkpoint_dir, 'models_t5_umt5-xxl-enc-bf16.pth'),
+        tokenizer_path=os.path.join(checkpoint_dir, 'google/umt5-xxl'),
+        shard_fn=None)
+        
+    def encode_prompt(self, prompt):
+        # 确保传递 device 参数
+        prompt_embeds, attention_mask = self.text_encoder(prompt, device=self.text_encoder.device)
+        return prompt_embeds, attention_mask
+        
+        
+class StepvideoTextEncoderWrapper(nn.Module):
+    def __init__(self, pretrained_model_name_or_path, device):
+        super().__init__()
+        
+        # 初始化LLM和CLIP编码器
+        clip_dir = os.path.join(pretrained_model_name_or_path, "hunyuan_clip")
+        llm_dir = os.path.join(pretrained_model_name_or_path, "step_llm")
+        
+        self.text_encoder = STEP1TextEncoder(llm_dir, max_length=320).to(device).eval()
+        self.clip = HunyuanClip(clip_dir, max_length=77).to(device).eval()
+    
+    def encode_prompt(self, prompt):
+        # 确保prompt是列表格式
+        # if isinstance(prompt, str):
+        #     prompt = [prompt]
+            
+        with torch.no_grad():
+            try:
+                # 获取LLM编码
+                y, y_mask = self.text_encoder(prompt)
+                print(f"y是：{y}")
+                
+
+                  
+                # 获取CLIP编码
+                clip_embedding, _ = self.clip(prompt)
+                print(f"clip是：{clip_embedding}")
+                # 调整attention mask以适应clip长度
+                len_clip = clip_embedding.shape[1]
+                y_mask = F.pad(y_mask, (len_clip, 0), value=1)
+                
+                # 准备返回数据
+                data = {
+                    'y': y.detach().cpu(),
+                    'y_mask': y_mask.detach().cpu(),
+                    'clip_embedding': clip_embedding.to(torch.bfloat16).detach().cpu()
+                }
+
+                return data
+                
+            except Exception as err:
+                print(f"{err}")
+                return None
+
+    
+
 
 class HunyuanTextEncoderWrapper(nn.Module):
 
@@ -61,7 +149,8 @@ class HunyuanTextEncoderWrapper(nn.Module):
         super().__init__()
 
         text_len = 256
-        crop_start = PROMPT_TEMPLATE["dit-llm-encode-video"].get("crop_start", 0)
+        crop_start = PROMPT_TEMPLATE["dit-llm-encode-video"].get(
+            "crop_start", 0)
 
         max_length = text_len + crop_start
 
@@ -70,7 +159,8 @@ class HunyuanTextEncoderWrapper(nn.Module):
 
         # prompt_template_video
         prompt_template_video = PROMPT_TEMPLATE["dit-llm-encode-video"]
-        text_encoder_path = os.path.join(pretrained_model_name_or_path, "text_encoder")
+        text_encoder_path = os.path.join(pretrained_model_name_or_path,
+                                         "text_encoder")
         self.text_encoder = TextEncoder(
             text_encoder_type="llm",
             text_encoder_path=text_encoder_path,
@@ -85,7 +175,8 @@ class HunyuanTextEncoderWrapper(nn.Module):
             logger=None,
             device=device,
         )
-        text_encoder_path_2 = os.path.join(pretrained_model_name_or_path, "text_encoder_2")
+        text_encoder_path_2 = os.path.join(pretrained_model_name_or_path,
+                                           "text_encoder_2")
         self.text_encoder_2 = TextEncoder(
             text_encoder_type="clipL",
             text_encoder_path=text_encoder_path_2,
@@ -106,7 +197,9 @@ class HunyuanTextEncoderWrapper(nn.Module):
         text_inputs = text_encoder.text2tokens(prompt, data_type=data_type)
 
         if clip_skip is None:
-            prompt_outputs = text_encoder.encode(text_inputs, data_type="video", device=device)
+            prompt_outputs = text_encoder.encode(text_inputs,
+                                                 data_type="video",
+                                                 device=device)
             prompt_embeds = prompt_outputs.hidden_state
         else:
             prompt_outputs = text_encoder.encode(
@@ -117,14 +210,16 @@ class HunyuanTextEncoderWrapper(nn.Module):
             )
             prompt_embeds = prompt_outputs.hidden_states_list[-(clip_skip + 1)]
 
-            prompt_embeds = text_encoder.model.text_model.final_layer_norm(prompt_embeds)
+            prompt_embeds = text_encoder.model.text_model.final_layer_norm(
+                prompt_embeds)
 
         attention_mask = prompt_outputs.attention_mask
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
             bs_embed, seq_len = attention_mask.shape
             attention_mask = attention_mask.repeat(1, num_videos_per_prompt)
-            attention_mask = attention_mask.view(bs_embed * num_videos_per_prompt, seq_len)
+            attention_mask = attention_mask.view(
+                bs_embed * num_videos_per_prompt, seq_len)
 
         if text_encoder is not None:
             prompt_embeds_dtype = text_encoder.dtype
@@ -133,23 +228,27 @@ class HunyuanTextEncoderWrapper(nn.Module):
         else:
             prompt_embeds_dtype = prompt_embeds.dtype
 
-        prompt_embeds = prompt_embeds.to(dtype=prompt_embeds_dtype, device=device)
+        prompt_embeds = prompt_embeds.to(dtype=prompt_embeds_dtype,
+                                         device=device)
 
         if prompt_embeds.ndim == 2:
             bs_embed, _ = prompt_embeds.shape
             # duplicate text embeddings for each generation per prompt, using mps friendly method
             prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt)
-            prompt_embeds = prompt_embeds.view(bs_embed * num_videos_per_prompt, -1)
+            prompt_embeds = prompt_embeds.view(
+                bs_embed * num_videos_per_prompt, -1)
         else:
             bs_embed, seq_len, _ = prompt_embeds.shape
             # duplicate text embeddings for each generation per prompt, using mps friendly method
             prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
-            prompt_embeds = prompt_embeds.view(bs_embed * num_videos_per_prompt, seq_len, -1)
+            prompt_embeds = prompt_embeds.view(
+                bs_embed * num_videos_per_prompt, seq_len, -1)
         return (prompt_embeds, attention_mask)
 
     def encode_prompt(self, prompt):
         prompt_embeds, attention_mask = self.encode_(prompt, self.text_encoder)
-        prompt_embeds_2, attention_mask_2 = self.encode_(prompt, self.text_encoder_2)
+        prompt_embeds_2, attention_mask_2 = self.encode_(
+            prompt, self.text_encoder_2)
         prompt_embeds_2 = F.pad(
             prompt_embeds_2,
             (0, prompt_embeds.shape[2] - prompt_embeds_2.shape[1]),
@@ -163,9 +262,11 @@ class MochiTextEncoderWrapper(nn.Module):
 
     def __init__(self, pretrained_model_name_or_path, device):
         super().__init__()
-        self.text_encoder = T5EncoderModel.from_pretrained(os.path.join(pretrained_model_name_or_path,
-                                                                        "text_encoder")).to(device)
-        self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(pretrained_model_name_or_path, "tokenizer"))
+        self.text_encoder = T5EncoderModel.from_pretrained(
+            os.path.join(pretrained_model_name_or_path,
+                         "text_encoder")).to(device)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            os.path.join(pretrained_model_name_or_path, "tokenizer"))
         self.max_sequence_length = 256
 
     def encode_prompt(self, prompt):
@@ -187,12 +288,19 @@ class MochiTextEncoderWrapper(nn.Module):
         prompt_attention_mask = text_inputs.attention_mask
         prompt_attention_mask = prompt_attention_mask.bool().to(device)
 
-        untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+        untruncated_ids = self.tokenizer(prompt,
+                                         padding="longest",
+                                         return_tensors="pt").input_ids
 
-        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
-            removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.max_sequence_length - 1:-1])
-            main_print(f"Truncated text input: {prompt} to: {removed_text} for model input.")
-        prompt_embeds = self.text_encoder(text_input_ids.to(device), attention_mask=prompt_attention_mask)[0]
+        if untruncated_ids.shape[-1] >= text_input_ids.shape[
+                -1] and not torch.equal(text_input_ids, untruncated_ids):
+            removed_text = self.tokenizer.batch_decode(
+                untruncated_ids[:, self.max_sequence_length - 1:-1])
+            main_print(
+                f"Truncated text input: {prompt} to: {removed_text} for model input."
+            )
+        prompt_embeds = self.text_encoder(
+            text_input_ids.to(device), attention_mask=prompt_attention_mask)[0]
         prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
 
         # duplicate text embeddings for each generation per prompt, using mps friendly method
@@ -208,16 +316,20 @@ def load_hunyuan_state_dict(model, dit_model_name_or_path):
     model_path = dit_model_name_or_path
     bare_model = "unknown"
 
-    state_dict = torch.load(model_path, map_location=lambda storage, loc: storage, weights_only=True)
+    state_dict = torch.load(model_path,
+                            map_location=lambda storage, loc: storage,
+                            weights_only=True)
 
-    if bare_model == "unknown" and ("ema" in state_dict or "module" in state_dict):
+    if bare_model == "unknown" and ("ema" in state_dict
+                                    or "module" in state_dict):
         bare_model = False
     if bare_model is False:
         if load_key in state_dict:
             state_dict = state_dict[load_key]
         else:
-            raise KeyError(f"Missing key: `{load_key}` in the checkpoint: {model_path}. The keys in the checkpoint "
-                           f"are: {list(state_dict.keys())}.")
+            raise KeyError(
+                f"Missing key: `{load_key}` in the checkpoint: {model_path}. The keys in the checkpoint "
+                f"are: {list(state_dict.keys())}.")
     model.load_state_dict(state_dict, strict=True)
     return model
 
@@ -242,6 +354,15 @@ def load_transformer(
                 torch_dtype=master_weight_type,
                 # torch_dtype=torch.bfloat16 if args.use_lora else torch.float32,
             )
+    elif model_type == "wan":
+        if dit_model_name_or_path:
+             transformer = WanModel.from_pretrained(dit_model_name_or_path,torch_dtype=master_weight_type)
+        else:
+            model_folder = os.path.join(pretrained_model_name_or_path,
+                                "transformer")
+            transformer = WanModel.from_pretrained(model_folder).to(dtype=torch.bfloat16)
+   
+
     elif model_type == "hunyuan_hf":
         if dit_model_name_or_path:
             transformer = HunyuanVideoTransformer3DModel.from_pretrained(
@@ -249,13 +370,16 @@ def load_transformer(
                 torch_dtype=master_weight_type,
                 # torch_dtype=torch.bfloat16 if args.use_lora else torch.float32,
             )
+    elif model_type == "stepvideo":
+        if dit_model_name_or_path:
+             transformer = StepVideoModel.from_pretrained(dit_model_name_or_path,use_safetensors=True).to(dtype=torch.bfloat16)
+              
+                
         else:
-            transformer = HunyuanVideoTransformer3DModel.from_pretrained(
-                pretrained_model_name_or_path,
-                subfolder="transformer",
-                torch_dtype=master_weight_type,
-                # torch_dtype=torch.bfloat16 if args.use_lora else torch.float32,
-            )
+            model_folder = os.path.join(pretrained_model_name_or_path,
+                                "transformer")
+            transformer = StepVideoModel.from_pretrained(model_folder,use_safetensors=True).to(dtype=torch.bfloat16)
+            
     elif model_type == "hunyuan":
         transformer = HYVideoDiffusionTransformer(
             in_channels=16,
@@ -263,43 +387,41 @@ def load_transformer(
             **hunyuan_config,
             dtype=master_weight_type,
         )
-        transformer = load_hunyuan_state_dict(transformer, dit_model_name_or_path)
+        transformer = load_hunyuan_state_dict(transformer,
+                                              dit_model_name_or_path)
         if master_weight_type == torch.bfloat16:
             transformer = transformer.bfloat16()
-    elif model_type == "wan":
-        if dit_model_name_or_path:
-            transformer = WanModel.from_pretrained(dit_model_name_or_path, torch_dtype=master_weight_type)
-        else:
-            model_folder = os.path.join(pretrained_model_name_or_path, "transformer")
-            transformer = WanModel.from_pretrained(model_folder).to(dtype=torch.bfloat16)
-    elif model_type == "wan_scm":
-        if dit_model_name_or_path:
-            transformer = WanModelSCM.from_pretrained(dit_model_name_or_path, torch_dtype=master_weight_type)
-        else:
-            model_folder = os.path.join(pretrained_model_name_or_path, "transformer")
-            transformer = WanModelSCM.from_pretrained(model_folder).to(dtype=torch.bfloat16)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
     return transformer
 
 
+
 def load_vae(model_type, pretrained_model_name_or_path):
     weight_dtype = torch.float32
     if model_type == "mochi":
-        vae = AutoencoderKLMochi.from_pretrained(pretrained_model_name_or_path,
-                                                 subfolder="vae",
-                                                 torch_dtype=weight_dtype).to("cuda")
+        vae = AutoencoderKLMochi.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="vae",
+            torch_dtype=weight_dtype).to("cuda")
         autocast_type = torch.bfloat16
         fps = 30
+    elif model_type == "wan":
+        checkpoint_dir = "/storage/lintaoLab/lintao/botehuang/diffusion/models/Wan2.1-T2V-14B-Diffusers"
+        vae = AutoencoderKLWan.from_pretrained(checkpoint_dir, subfolder="vae", torch_dtype=torch.bfloat16).to("cuda")
+        autocast_type = torch.bfloat16
+        fps = 30        
     elif model_type == "hunyuan_hf":
-        vae = AutoencoderKLHunyuanVideo.from_pretrained(pretrained_model_name_or_path,
-                                                        subfolder="vae",
-                                                        torch_dtype=weight_dtype).to("cuda")
+        vae = AutoencoderKLHunyuanVideo.from_pretrained(
+            pretrained_model_name_or_path,
+            subfolder="vae",
+            torch_dtype=weight_dtype).to("cuda")
         autocast_type = torch.bfloat16
         fps = 24
     elif model_type == "hunyuan":
         vae_precision = torch.float32
-        vae_path = os.path.join(pretrained_model_name_or_path, "hunyuan-video-t2v-720p/vae")
+        vae_path = os.path.join(pretrained_model_name_or_path,
+                                "hunyuan-video-t2v-720p/vae")
 
         config = AutoencoderKLCausal3D.load_config(vae_path)
         vae = AutoencoderKLCausal3D.from_config(config)
@@ -311,7 +433,10 @@ def load_vae(model_type, pretrained_model_name_or_path):
         if "state_dict" in ckpt:
             ckpt = ckpt["state_dict"]
         if any(k.startswith("vae.") for k in ckpt.keys()):
-            ckpt = {k.replace("vae.", ""): v for k, v in ckpt.items() if k.startswith("vae.")}
+            ckpt = {
+                k.replace("vae.", ""): v
+                for k, v in ckpt.items() if k.startswith("vae.")
+            }
         vae.load_state_dict(ckpt)
         vae = vae.to(dtype=vae_precision)
         vae.requires_grad_(False)
@@ -319,14 +444,31 @@ def load_vae(model_type, pretrained_model_name_or_path):
         vae.eval()
         autocast_type = torch.float32
         fps = 24
+    elif model_type =="stepvideo":
+        vae = AutoencoderKL(
+            z_channels=64,
+            model_path=f"{pretrained_model_name_or_path}/vae/vae_v2.safetensors",
+            version=2).to(torch.bfloat16).to("cuda")
+        autocast_type = torch.bfloat16
+        fps = 30        
     return vae, autocast_type, fps
 
 
-def load_text_encoder(model_type, pretrained_model_name_or_path, device):
+
+
+def load_text_encoder(model_type, pretrained_model_name_or_path, device) -> MochiTextEncoderWrapper | HunyuanTextEncoderWrapper | StepvideoTextEncoderWrapper:
     if model_type == "mochi":
-        text_encoder = MochiTextEncoderWrapper(pretrained_model_name_or_path, device)
+        text_encoder = MochiTextEncoderWrapper(pretrained_model_name_or_path,
+                                               device)
+    elif model_type == "wan":
+        text_encoder = WanTextEncoderWrapper(pretrained_model_name_or_path)
+    elif model_type == "stepvideo":
+        text_encoder = StepvideoTextEncoderWrapper(pretrained_model_name_or_path,
+                                                 device)
     elif model_type == "hunyuan" or "hunyuan_hf":
-        text_encoder = HunyuanTextEncoderWrapper(pretrained_model_name_or_path, device)
+        text_encoder = HunyuanTextEncoderWrapper(pretrained_model_name_or_path,
+                                                 device)
+
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
     return text_encoder
@@ -337,19 +479,24 @@ def get_no_split_modules(transformer):
     if isinstance(transformer, MochiTransformer3DModel):
         return (MochiTransformerBlock, )
     elif isinstance(transformer, HunyuanVideoTransformer3DModel):
-        return (HunyuanVideoSingleTransformerBlock, HunyuanVideoTransformerBlock)
+        return (HunyuanVideoSingleTransformerBlock,
+                HunyuanVideoTransformerBlock)
     elif isinstance(transformer, HYVideoDiffusionTransformer):
         return (MMDoubleStreamBlock, MMSingleStreamBlock)
-    elif isinstance(transformer, (WanModel, WanModelSCM)):
-        return (WanAttentionBlock,)
+    elif isinstance(transformer,StepVideoModel):
+        return(StepVideoTransformerBlock, PatchEmbed)
+    elif isinstance(transformer,WanModel):
+        return(WanAttentionBlock,)
     else:
         raise ValueError(f"Unsupported transformer type: {type(transformer)}")
 
 
 if __name__ == "__main__":
     # test encode prompt
+    
     device = torch.cuda.current_device()
     pretrained_model_name_or_path = "data/hunyuan"
-    text_encoder = load_text_encoder("hunyuan", pretrained_model_name_or_path, device)
+    text_encoder = load_text_encoder("hunyuan", pretrained_model_name_or_path,
+                                     device)
     prompt = "A man on stage claps his hands together while facing the audience. The audience, visible in the foreground, holds up mobile devices to record the event, capturing the moment from various angles. The background features a large banner with text identifying the man on stage. Throughout the sequence, the man's expression remains engaged and directed towards the audience. The camera angle remains constant, focusing on capturing the interaction between the man on stage and the audience."
     prompt_embeds, attention_mask = text_encoder.encode_prompt(prompt)

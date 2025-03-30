@@ -11,7 +11,7 @@ class WanModelSCM(WanModel):
         self.logvar_linear = None
         if logvar:
             self.logvar_scale_factor = logvar_scale_factor
-            self.logvar_linear = nn.Linear(self.hidden_size, 1)
+            self.logvar_linear = nn.Linear(self.dim, 1)
 
     def forward(self,x,t,context,seq_len,clip_fea=None,y=None, return_logvar=False, jvp=False, **kwargs):
         r"""
@@ -45,26 +45,30 @@ class WanModelSCM(WanModel):
         
         # TrigFlow --> Flow Transformation
         # the input now is [0, np.pi/2], arctan(N(P_mean, P_std))
-        t = torch.sin(timestep) / (torch.cos(timestep) + torch.sin(timestep))
+        t = torch.sin(t) / (torch.cos(t) + torch.sin(t))
 
         # stabilize large resolution training
         pretrain_timestep = t * 1000
-        t = t.view(-1, 1, 1, 1)
 
         # scale input based on timestep
-        x = x * torch.sqrt(t**2 + (1 - t) ** 2)
+        t = t.view(-1, 1, 1, 1, 1)
+        scale_factor = torch.sqrt(t**2 + (1 - t) ** 2)
+        x = [x_i * scale_factor for x_i in x]
+        x= x[0]
+        
+        t =t.flatten()
 
         # forward in original flow
         if return_logvar and self.logvar_linear is not None:
-            model_out = super().forward(x,t,context,seq_len,clip_fea=None,y=None, jvp=jvp, **kwargs)
+            model_out = super().forward(x,t,context,seq_len,clip_fea=None,y=None, **kwargs)
             logvar = self.logvar_linear(t) * self.logvar_scale_factor
         else:
-            model_out = super().forward(self,x,t,context,seq_len,clip_fea=None,y=None,jvp=jvp, **kwargs)
+            model_out = super().forward(x,t,context,seq_len,clip_fea=None,y=None, **kwargs)
 
         # Flow --> TrigFlow Transformation
-        trigflow_model_out = ((1 - 2 * t) * x + (1 - 2 * t + 2 * t**2) * model_out) / torch.sqrt(
-            t**2 + (1 - t) ** 2
-        )
+        # Directly apply TrigFlow transformation regardless of jvp flag
+        trigflow_model_out = [((1 - 2 * t) * x_i + (1 - 2 * t + 2 * t**2) * model_out_i) / torch.sqrt(t**2 + (1 - t) ** 2)
+                             for x_i, model_out_i in zip(x, model_out)]
 
         if return_logvar:
             return trigflow_model_out, logvar
