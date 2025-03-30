@@ -220,6 +220,8 @@ def distill_one_step(
             g_norm = g_norm.mean()
             
         
+        pred_x_0 = torch.cos(t_G) * x_t - torch.sin(t_G) * F_theta * sigma_data
+
         # Calculate model prediction norms
         get_norm(F_theta.detach().float(), model_pred_norm, gradient_accumulation_steps)
         loss.backward()
@@ -230,9 +232,13 @@ def distill_one_step(
 
 
    
-    grad_norm = clip_grad.clip_grad_norm_(transformer.parameters(), max_grad_norm)
-    optimizer.step()
-    lr_scheduler.step()
+    if phase == "G":
+        grad_norm = clip_grad.clip_grad_norm_(transformer.parameters(), max_grad_norm)
+        optimizer_G.step()
+        lr_scheduler.step()
+    else:
+        grad_norm = clip_grad.clip_grad_norm_(disc.parameters(), max_grad_norm)
+        optimizer_D.step()
 
     return total_loss, grad_norm.item(), model_pred_norm
 
