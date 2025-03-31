@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKLHunyuanVideo, AutoencoderKLMochi, AutoencoderKLWan
+from diffusers import AutoencoderKLHunyuanVideo, AutoencoderKLMochi
 from torch import nn
 from transformers import AutoTokenizer, T5EncoderModel
 
@@ -14,7 +14,7 @@ from fastvideo.models.hunyuan.vae.autoencoder_kl_causal_3d import AutoencoderKLC
 from fastvideo.models.hunyuan_hf.modeling_hunyuan import (HunyuanVideoSingleTransformerBlock,
                                                           HunyuanVideoTransformer3DModel, HunyuanVideoTransformerBlock)
 from fastvideo.models.mochi_hf.modeling_mochi import MochiTransformer3DModel, MochiTransformerBlock
-from Wan.wan.modules.model import WanModel, WanAttentionBlock
+from video_sana.models.wan.modules.model import WanModel, WanAttentionBlock
 from video_sana.models.scm_model.wan_scm import WanModelSCM
 from fastvideo.utils.logging_ import main_print
 
