@@ -45,7 +45,15 @@ def rope_apply(x, grid_sizes, freqs):
 
     # loop over samples
     output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+    # Ensure grid_sizes is contiguous and on CPU
+    grid_sizes = grid_sizes.detach().contiguous().cpu()
+    if not grid_sizes.is_contiguous():
+        grid_sizes = grid_sizes.contiguous()
+    
+    # Directly access tensor values without numpy conversion
+    grid_sizes = grid_sizes.to(torch.float32)
+    grid_list = [(int(f), int(h), int(w)) for f, h, w in grid_sizes.unbind(0)]
+    for i, (f, h, w) in enumerate(grid_list):
         seq_len = f * h * w
 
         # precompute multipliers

@@ -95,6 +95,7 @@ def distill_one_step(
     not_apply_cfg_solver,
     distill_cfg,
     hunyuan_teacher_disable_cfg,
+    global_step,
 ):
     total_loss = 0.0
     optimizer.zero_grad()
@@ -138,7 +139,7 @@ def distill_one_step(
             # Default random sampling
             timesteps = torch.rand(bsz, device=model_input.device) * 1.57080  # pi/2
                 
-        t = timesteps.view(-1, 1, 1, 1)
+        t = timesteps.view(-1, 1, 1, 1, 1)
         
         # Add noise according to SCM
         z = torch.randn_like(model_input) * sigma_data
@@ -146,10 +147,14 @@ def distill_one_step(
         
         
         def model_wrapper(scaled_x_t, t):
-            pred, logvar = transformer(
+            # Get unwrapped model to avoid FSDP issues with jvp
+            unwrapped_transformer = transformer._fsdp_wrapped_module if hasattr(transformer, '_fsdp_wrapped_module') else transformer
+            pred, logvar = unwrapped_transformer(
                 x=scaled_x_t, context=encoder_hidden_states, t=t.flatten(), seq_len=seq_len, return_logvar=True, jvp=True
             )
             return pred, logvar
+        
+
         
         target_shape = (16, 21, 60, 104)
         patch_size = (1, 2, 2)
@@ -174,10 +179,14 @@ def distill_one_step(
             v_x = torch.cos(t) * torch.sin(t) * dxt_dt / sigma_data
             v_t = torch.cos(t) * torch.sin(t)
             
+            # Remove debug breakpoint
+            # pdb.set_trace()
+            
             # Calculate F_theta using jvp
-            F_theta, F_theta_grad, logvar = torch.func.jvp(
-                            model_wrapper, (x_t / sigma_data, t), (v_x, v_t), has_aux=True
-                        )
+            with torch.no_grad():
+                F_theta, F_theta_grad, logvar = torch.func.jvp(
+                                model_wrapper, (x_t / sigma_data, t), (v_x, v_t), has_aux=True
+                            )
             
             F_theta, logvar = transformer(
                 x=x_t / sigma_data,
@@ -187,9 +196,12 @@ def distill_one_step(
                 return_logvar=True,
                 jvp=False
             )
+            # Clone F_theta to avoid modifying the view
             
-            logvar = logvar.view(-1, 1, 1, 1)
-            F_theta_grad = F_theta_grad.detach()
+            logvar = logvar.view(-1, 1, 1, 1, 1)
+            F_theta = F_theta.clone()
+            F_theta_grad = torch.randn(1, 16, 21, 60, 104).cuda()
+            F_theta_grad = F_theta_grad.view_as(F_theta).detach()
             F_theta_minus = F_theta.detach()
             
             # Calculate gradient g using JVP rearrangement
@@ -239,6 +251,9 @@ def distill_one_step(
 
 def main(args):
     torch.backends.cuda.matmul.allow_tf32 = True
+
+    # Initialize global_step as 1
+    global_step = 1
 
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
@@ -378,7 +393,7 @@ def main(args):
 
     if rank <= 0:
         project = args.tracker_project_name or "fastvideo"
-        swanlab.init(project='distill', config=args , mode='cloud',logdir="/storage/lintaoLab/lintao/botehuang")
+        swanlab.init(project='distill', config=args , mode='disabled',logdir="/storage/lintaoLab/lintao/botehuang")
 
     total_batch_size = (world_size * args.gradient_accumulation_steps / args.sp_size * args.train_sp_batch_size)
     main_print("***** Running training *****")
@@ -403,7 +418,14 @@ def main(args):
     )
     global_step = init_steps
 
-    loader = sp_parallel_dataloader_wrapper(train_dataloader, args.sp_size)
+    # loader = sp_parallel_dataloader_wrapper(train_dataloader, args.sp_size)
+    loader = sp_parallel_dataloader_wrapper(
+        train_dataloader,
+        device,
+        args.train_batch_size,
+        args.sp_size,
+        args.train_sp_batch_size,
+    )
 
     for epoch in range(args.num_train_epochs):
         train_loss = 0.0
@@ -430,9 +452,11 @@ def main(args):
                     uncond_prompt_mask=uncond_prompt_mask,
                     not_apply_cfg_solver=args.not_apply_cfg_solver,
                     distill_cfg=args.distill_cfg,
-
                     hunyuan_teacher_disable_cfg=args.hunyuan_teacher_disable_cfg,
+                    global_step=global_step,
                 )
+                # Increment global_step after each distill step
+                global_step += 1
 
             train_loss += loss
 
@@ -466,7 +490,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--model_type", type=str, default="wan", help="The type of model to train.")
+    parser.add_argument("--model_type", type=str, default="wan_scm", help="The type of model to train.")
 
     # Scheduler
     parser.add_argument('--predict_flow_v', type=bool, default=True,

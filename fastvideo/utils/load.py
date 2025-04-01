@@ -28,6 +28,19 @@ hunyuan_config = {
     "guidance_embed": True,
 }
 
+wan_config = {
+    "patch_size": (1, 2, 2),
+    "dim": 1536,
+    "ffn_dim": 8960,
+    "freq_dim": 256,
+    "num_heads": 12,
+    "num_layers": 30,
+    "window_size": (-1, -1),
+    "qk_norm": True,
+    "cross_attn_norm": True,
+    "eps": 1e-6,
+}
+
 PROMPT_TEMPLATE_ENCODE = (
     "<|start_header_id|>system<|end_header_id|>\n\nDescribe the image by detailing the color, shape, size, texture, "
     "quantity, text, spatial relationships of the objects and background:<|eot_id|>"
