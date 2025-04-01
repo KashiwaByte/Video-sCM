@@ -174,7 +174,10 @@ def distill_one_step(
             }
             
             # Calculate v_x and v_t for jvp
-            pretrain_pred = teacher_transformer(**model_kwargs)[0]
+            with torch.no_grad():
+                print("教师模型开始计算")
+                pretrain_pred = teacher_transformer(**model_kwargs)[0]
+            pretrain_pred = pretrain_pred[0]
             dxt_dt = sigma_data * pretrain_pred
             v_x = torch.cos(t) * torch.sin(t) * dxt_dt / sigma_data
             v_t = torch.cos(t) * torch.sin(t)
@@ -183,11 +186,12 @@ def distill_one_step(
             # pdb.set_trace()
             
             # Calculate F_theta using jvp
-            with torch.no_grad():
-                F_theta, F_theta_grad, logvar = torch.func.jvp(
-                                model_wrapper, (x_t / sigma_data, t), (v_x, v_t), has_aux=True
-                            )
+            # with torch.no_grad():
+            #     F_theta, F_theta_grad, logvar = torch.func.jvp(
+            #                     model_wrapper, (x_t / sigma_data, t), (v_x, v_t), has_aux=True
+            #                 )
             
+            print("学生模型开始计算")
             F_theta, logvar = transformer(
                 x=x_t / sigma_data,
                 context=encoder_hidden_states,
@@ -199,6 +203,7 @@ def distill_one_step(
             # Clone F_theta to avoid modifying the view
             
             logvar = logvar.view(-1, 1, 1, 1, 1)
+            F_theta = F_theta[0]
             F_theta = F_theta.clone()
             F_theta_grad = torch.randn(1, 16, 21, 60, 104).cuda()
             F_theta_grad = F_theta_grad.view_as(F_theta).detach()
@@ -562,7 +567,7 @@ if __name__ == "__main__":
     
     
     # dataset & dataloader
-    parser.add_argument("--data_json_path", type=str , default= "/storage/lintaoLab/lintao/botehuang/datasets/webvid-10k/Image-Vid-wan/videos2caption.json")
+    parser.add_argument("--data_json_path", type=str , default= "/run/determined/workdir/data/H800/datasets/webvid-10k/Image-Vid-wan/videos2caption.json")
     parser.add_argument("--num_height", type=int, default=480)
     parser.add_argument("--num_width", type=int, default=832)
     parser.add_argument("--num_frames", type=int, default=81)
@@ -575,7 +580,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=16,
+        default=4,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument("--num_latent_t", type=int, default=32, help="Number of latent timesteps.")
@@ -583,15 +588,15 @@ if __name__ == "__main__":
     parser.add_argument("--group_resolution", action="store_true")  # TODO
 
     # text encoder & vae & diffusion model
-    parser.add_argument("--pretrained_model_name_or_path", type=str,default=" /storage/lintaoLab/lintao/botehuang/diffusion/models/Wan2.1-T2V-1.3B")
-    parser.add_argument("--dit_model_name_or_path", type=str , default= "/storage/lintaoLab/lintao/botehuang/diffusion/models/Wan2.1-T2V-1.3B")
+    parser.add_argument("--pretrained_model_name_or_path", type=str,default=" /run/determined/workdir/data/H800/diffusion/models/Wan2.1-T2V-1.3B")
+    parser.add_argument("--dit_model_name_or_path", type=str , default= "/run/determined/workdir/data/H800/diffusion/models/Wan2.1-T2V-1.3B")
     parser.add_argument("--cache_dir", type=str, default="./cache_dir")
 
     # diffusion setting
     parser.add_argument("--cfg", type=float, default=0.1)
 
     # validation & logs
-    parser.add_argument("--validation_prompt_dir", type=str, default="/storage/lintaoLab/lintao/botehuang/datasets/webvid-10k/Image-Vid-Finetune-wan/validation")
+    parser.add_argument("--validation_prompt_dir", type=str, default="/run/determined/workdir/data/H800/datasets/webvid-10k/Image-Vid-Finetune-wan/validation")
     parser.add_argument("--validation_sampling_steps", type=str, default="25")
     parser.add_argument("--validation_guidance_scale", type=str, default="4.5")
 
@@ -602,7 +607,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/storage/lintaoLab/lintao/botehuang/datasets/webvid-10k/outputs/wan-1.3B-1e6-16-latent32",
+        default="/run/determined/workdir/data/H800/datasets/webvid-10k/outputs/wan-1.3B-1e6-16-latent32",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(

@@ -683,7 +683,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=16,
+        default=4,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument("--num_latent_t", type=int, default=32, help="Number of latent timesteps.")

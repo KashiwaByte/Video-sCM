@@ -1,6 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
-
+import pdb
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
@@ -45,15 +45,7 @@ def rope_apply(x, grid_sizes, freqs):
 
     # loop over samples
     output = []
-    # Ensure grid_sizes is contiguous and on CPU
-    grid_sizes = grid_sizes.detach().contiguous().cpu()
-    if not grid_sizes.is_contiguous():
-        grid_sizes = grid_sizes.contiguous()
-    
-    # Directly access tensor values without numpy conversion
-    grid_sizes = grid_sizes.to(torch.float32)
-    grid_list = [(int(f), int(h), int(w)) for f, h, w in grid_sizes.unbind(0)]
-    for i, (f, h, w) in enumerate(grid_list):
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
 
         # precompute multipliers
@@ -150,6 +142,8 @@ class WanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
+
+        # pdb.set_trace()
 
         x = flash_attention(
             q=rope_apply(q, grid_sizes, freqs),
@@ -517,6 +511,9 @@ class WanModel(ModelMixin, ConfigMixin):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
+        
+
+        
         if self.model_type == 'i2v':
             assert clip_fea is not None and y is not None
         # params
@@ -567,9 +564,15 @@ class WanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens)
+        
+        # pdb.set_trace()
 
+
+        block_count = 0
         for block in self.blocks:
             x = block(x, **kwargs)
+            block_count+=1
+            print(f"执行到{block_count}")
 
         # head
         x = self.head(x, e)

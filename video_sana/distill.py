@@ -619,13 +619,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=4,
+        default=2,
         help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.",
     )
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=16,
+        default=4,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument("--num_latent_t", type=int, default=32, help="Number of latent timesteps.")

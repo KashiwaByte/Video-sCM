@@ -1,15 +1,34 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import math
-
+import pdb
 import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
+from collections.abc import Iterable
+from torch.utils.checkpoint import checkpoint, checkpoint_sequential
+
+
 
 from models.wan.modules.attention import flash_attention
 
 __all__ = ['WanModel']
+
+def auto_grad_checkpoint(module, x, **kwargs):
+    if getattr(module, "grad_checkpointing", False):
+        if isinstance(module, Iterable):
+            gc_step = module[0].grad_checkpointing_step
+            return checkpoint_sequential(module, gc_step, x)
+        else:
+            e = kwargs.get('e')
+            seq_lens = kwargs.get('seq_lens')
+            grid_sizes = kwargs.get('grid_sizes')
+            freqs = kwargs.get('freqs')
+            context = kwargs.get('context')
+            context_lens = kwargs.get('context_lens')
+            return checkpoint(module, x, e, seq_lens, grid_sizes, freqs, context, context_lens)
+    return module(x, **kwargs)
 
 class TimestepEmbedder(nn.Module):
     """
@@ -87,15 +106,7 @@ def rope_apply(x, grid_sizes, freqs):
 
     # loop over samples
     output = []
-    # Ensure grid_sizes is contiguous and on CPU
-    grid_sizes = grid_sizes.detach().contiguous().cpu()
-    if not grid_sizes.is_contiguous():
-        grid_sizes = grid_sizes.contiguous()
-    
-    # Directly access tensor values without numpy conversion
-    grid_sizes = grid_sizes.to(torch.float32)
-    grid_list = [(int(f), int(h), int(w)) for f, h, w in grid_sizes.unbind(0)]
-    for i, (f, h, w) in enumerate(grid_list):
+    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
 
         # precompute multipliers
@@ -193,6 +204,7 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
+        # pdb.set_trace()
         x = flash_attention(
             q=rope_apply(q, grid_sizes, freqs),
             k=rope_apply(k, grid_sizes, freqs),
@@ -344,6 +356,7 @@ class WanAttentionBlock(nn.Module):
             e = (self.modulation + e).chunk(6, dim=1)
         assert e[0].dtype == torch.float32
 
+        # pdb.set_trace()
         # self-attention
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
@@ -570,6 +583,8 @@ class WanModelSCM(ModelMixin, ConfigMixin):
         """
         # TrigFlow --> Flow Transformation
         # the input now is [0, np.pi/2], arctan(N(P_mean, P_std))
+        
+        
         t = torch.sin(t) / (torch.cos(t) + torch.sin(t))
 
         # stabilize large resolution training
@@ -582,7 +597,9 @@ class WanModelSCM(ModelMixin, ConfigMixin):
         x = [x_i.squeeze(0) if x_i.shape[0] == 1 and len(x_i.shape) > 4 else x_i for x_i in x]
 
         t = pretrain_timestep
-        
+            
+    
+
         if self.model_type == 'i2v':
             assert clip_fea is not None and y is not None
         # params
@@ -633,9 +650,23 @@ class WanModelSCM(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens)
+        
+               
 
+        block_count = 0
         for block in self.blocks:
-            x = block(x, **kwargs)
+            block.grad_checkpointing = True
+            block.grad_checkpointing_step = 4  # 设置更细粒度的检查点步长
+            if jvp:
+                x = block(x, **kwargs)
+            else:
+                x = auto_grad_checkpoint(
+                    block,
+                    x,
+                    **kwargs,
+                )
+            block_count+=1
+            print(f"执行到{block_count}")
 
         # head
         x = self.head(x, e)
@@ -651,7 +682,7 @@ class WanModelSCM(ModelMixin, ConfigMixin):
                              for x_i, model_out_i in zip(x, model_out)]
         
         if return_logvar :
-            # self.logvar_scale_factor = 1.0
+            self.logvar_scale_factor = 1.0
             self.logvar_linear = nn.Linear(self.dim, 1)
             self.logvar_linear.cuda()
             self.t_embedder = TimestepEmbedder(self.dim)
