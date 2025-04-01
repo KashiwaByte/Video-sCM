@@ -444,7 +444,7 @@ def main(args):
 
     if rank <= 0:
         project = args.tracker_project_name or "fastvideo"
-        swanlab.init(project='distill', config=args , mode='cloud',logdir="/storage/lintaoLab/lintao/botehuang")
+        swanlab.init(project='distill', config=args , mode='cloud',logdir="./swanlab")
     # Train!
     total_batch_size = (world_size * args.gradient_accumulation_steps / args.sp_size * args.train_sp_batch_size)
     main_print("***** Running training *****")
@@ -569,7 +569,7 @@ def main(args):
                 else:
                     save_checkpoint(transformer, rank, args.output_dir, step)
             dist.barrier()
-        if args.log_validation and step % args.validation_steps == 0:
+        if args.log_validation and step % args.validation_steps == 0:   
             log_validation(
                 args,
                 transformer,
@@ -613,7 +613,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_type", type=str, default="wan", help="The type of model to train.")
 
     # dataset & dataloader
-    parser.add_argument("--data_json_path", type=str , default= "/storage/lintaoLab/lintao/botehuang/datasets/webvid-10k/Image-Vid-wan/videos2caption.json")
+    parser.add_argument("--data_json_path", type=str , default= "/labdata1/botehuang/H800/datasets/webvid-10k/Image-Vid-wan/videos2caption.json")
     parser.add_argument("--num_height", type=int, default=480)
     parser.add_argument("--num_width", type=int, default=832)
     parser.add_argument("--num_frames", type=int, default=81)
@@ -634,8 +634,8 @@ if __name__ == "__main__":
     parser.add_argument("--group_resolution", action="store_true")  # TODO
 
     # text encoder & vae & diffusion model
-    parser.add_argument("--pretrained_model_name_or_path", type=str,default=" /storage/lintaoLab/lintao/botehuang/diffusion/models/Wan2.1-T2V-1.3B")
-    parser.add_argument("--dit_model_name_or_path", type=str , default= "/storage/lintaoLab/lintao/botehuang/diffusion/models/Wan2.1-T2V-1.3B")
+    parser.add_argument("--pretrained_model_name_or_path", type=str,default="/labdata1/botehuang/H800/diffusion/models/Wan2.1-T2V-1.3B")
+    parser.add_argument("--dit_model_name_or_path", type=str , default= "/labdata1/botehuang/H800/diffusion/models/Wan2.1-T2V-1.3B")
     parser.add_argument("--cache_dir", type=str, default="./cache_dir")
 
     # diffusion setting
@@ -644,7 +644,7 @@ if __name__ == "__main__":
     parser.add_argument("--cfg", type=float, default=0.1)
 
     # validation & logs
-    parser.add_argument("--validation_prompt_dir", type=str, default="/storage/lintaoLab/lintao/botehuang/datasets/webvid-10k/Image-Vid-Finetune-wan/validation")
+    parser.add_argument("--validation_prompt_dir", type=str, default="/labdata1/botehuang/H800/datasets/webvid-10k/Image-Vid-Finetune-wan/validation")
     parser.add_argument("--validation_sampling_steps", type=str, default="25")
     parser.add_argument("--validation_guidance_scale", type=str, default="4.5")
 
@@ -655,7 +655,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/storage/lintaoLab/lintao/botehuang/datasets/webvid-10k/outputs/wan-1.3B-1e6-16-latent32",
+        default="/labdata1/botehuang/H800/datasets/webvid-10k/outputs/test-wan-1.3B-1e6-16-latent32",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
