@@ -27,10 +27,10 @@ class LatentDataset(Dataset):
         # json.load(f) already keeps the order
         # self.data_anno = sorted(self.data_anno, key=lambda x: x['latent_path'])
         self.num_latent_t = num_latent_t
-        # just zero embeddings [256, 4096]
-        self.uncond_prompt_embed = torch.zeros(256, 4096).to(torch.float32)
-        # 256 zeros
-        self.uncond_prompt_mask = torch.zeros(256).bool()
+        # just zero embeddings [512, 4096]
+        self.uncond_prompt_embed = torch.zeros(512, 4096).to(torch.float32)
+        # 512 zeros
+        self.uncond_prompt_mask = torch.zeros(512).bool()
         self.lengths = [data_item["length"] if "length" in data_item else 1 for data_item in self.data_anno]
 
     def __getitem__(self, idx):

@@ -41,5 +41,9 @@ def normalize_dit_input(model_type, latents):
         return latents * 0.476986
     elif model_type == "hunyuan":
         return latents * 0.476986
+    elif model_type == "wan":
+        return latents * 1
+    elif model_type == "wan_scm":
+        return latents * 1
     else:
         raise NotImplementedError(f"model_type {model_type} not supported")

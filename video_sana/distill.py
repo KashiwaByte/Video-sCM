@@ -50,7 +50,6 @@ from fastvideo.utils.parallel_states import (destroy_sequence_parallel_group, ge
                                              initialize_sequence_parallel_state)
 from fastvideo.utils.validation import log_validation
 
-from Wan.wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.31.0")
@@ -613,7 +612,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_type", type=str, default="wan", help="The type of model to train.")
 
     # dataset & dataloader
-    parser.add_argument("--data_json_path", type=str , default= "/labdata1/botehuang/H800/datasets/webvid-10k/Image-Vid-wan/videos2caption.json")
+    parser.add_argument("--data_json_path", type=str , default= "/run/determined/workdir/data/H800/datasets/webvid-10k/Image-Vid-wan/videos2caption.json")
     parser.add_argument("--num_height", type=int, default=480)
     parser.add_argument("--num_width", type=int, default=832)
     parser.add_argument("--num_frames", type=int, default=81)
@@ -634,8 +633,8 @@ if __name__ == "__main__":
     parser.add_argument("--group_resolution", action="store_true")  # TODO
 
     # text encoder & vae & diffusion model
-    parser.add_argument("--pretrained_model_name_or_path", type=str,default="/labdata1/botehuang/H800/diffusion/models/Wan2.1-T2V-1.3B")
-    parser.add_argument("--dit_model_name_or_path", type=str , default= "/labdata1/botehuang/H800/diffusion/models/Wan2.1-T2V-1.3B")
+    parser.add_argument("--pretrained_model_name_or_path", type=str,default="/run/determined/workdir/data/H800/diffusion/models/Wan2.1-T2V-1.3B")
+    parser.add_argument("--dit_model_name_or_path", type=str , default= "/run/determined/workdir/data/H800/diffusion/models/Wan2.1-T2V-1.3B")
     parser.add_argument("--cache_dir", type=str, default="./cache_dir")
 
     # diffusion setting
@@ -644,7 +643,7 @@ if __name__ == "__main__":
     parser.add_argument("--cfg", type=float, default=0.1)
 
     # validation & logs
-    parser.add_argument("--validation_prompt_dir", type=str, default="/labdata1/botehuang/H800/datasets/webvid-10k/Image-Vid-Finetune-wan/validation")
+    parser.add_argument("--validation_prompt_dir", type=str, default="/run/determined/workdir/data/H800/datasets/webvid-10k/Image-Vid-Finetune-wan/validation")
     parser.add_argument("--validation_sampling_steps", type=str, default="25")
     parser.add_argument("--validation_guidance_scale", type=str, default="4.5")
 
@@ -655,7 +654,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/labdata1/botehuang/H800/datasets/webvid-10k/outputs/test-wan-1.3B-1e6-16-latent32",
+        default="/run/determined/workdir/data/H800/datasets/webvid-10k/outputs/test-wan-1.3B-1e6-16-latent32",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
