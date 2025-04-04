@@ -724,7 +724,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=160,
+        default=160000,
         help=("Save a checkpoint of the training state every X updates. These checkpoints can be used both as final"
               " checkpoints in case they are better than the last checkpoint, and are also suitable for resuming"
               " training using `--resume_from_checkpoint`."),
@@ -757,7 +757,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_train_steps",
         type=int,
-        default=320,
+        default=32000,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
     )
     parser.add_argument(

@@ -11,7 +11,7 @@ from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 
 
 
-from models.wan.modules.attention import flash_attention
+from models.scm_model.modules.attention import flash_attention
 
 __all__ = ['WanModel']
 
@@ -30,6 +30,48 @@ def auto_grad_checkpoint(module, x, **kwargs):
             return checkpoint(module, x, e, seq_lens, grid_sizes, freqs, context, context_lens)
     return module(x, **kwargs)
 
+# class TimestepEmbedder(nn.Module):
+#     """
+#     Embeds scalar timesteps into vector representations.
+#     """
+
+#     def __init__(self, hidden_size, frequency_embedding_size=256):
+#         super().__init__()
+#         self.mlp = nn.Sequential( nn.Linear(frequency_embedding_size, hidden_size, bias=True).cuda(), nn.SiLU(), nn.Linear(hidden_size, hidden_size, bias=True).cuda(), )
+#         self.frequency_embedding_size = frequency_embedding_size
+
+#     @staticmethod
+#     def timestep_embedding(t, dim, max_period=10000):
+#         """
+#         Create sinusoidal timestep embeddings.
+#         :param t: a 1-D Tensor of N indices, one per batch element.
+#                           These may be fractional.
+#         :param dim: the dimension of the output.
+#         :param max_period: controls the minimum frequency of the embeddings.
+#         :return: an (N, D) Tensor of positional embeddings.
+#         """
+#         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+#         half = dim // 2
+#         freqs = torch.exp( -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half ).cuda()
+#         args = t[:, None].float() * freqs[None]
+#         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1).cuda()
+#         if dim % 2:
+#             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+#         return embedding
+
+#     def forward(self, t):
+#         t_freq = self.timestep_embedding(t, self.frequency_embedding_size).to(self.dtype)
+#         t_emb = self.mlp(t_freq)
+#         return t_emb
+
+#     @property
+#     def dtype(self):
+#         try:
+#             return next(self.parameters()).dtype
+#         except StopIteration:
+#             return torch.float32
+
+
 class TimestepEmbedder(nn.Module):
     """
     Embeds scalar timesteps into vector representations.
@@ -37,7 +79,7 @@ class TimestepEmbedder(nn.Module):
 
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
-        self.mlp = nn.Sequential( nn.Linear(frequency_embedding_size, hidden_size, bias=True).cuda(), nn.SiLU(), nn.Linear(hidden_size, hidden_size, bias=True).cuda(), )
+        self.mlp = nn.Sequential( nn.Linear(frequency_embedding_size, hidden_size, bias=True), nn.SiLU(), nn.Linear(hidden_size, hidden_size, bias=True), )
         self.frequency_embedding_size = frequency_embedding_size
 
     @staticmethod
@@ -52,9 +94,9 @@ class TimestepEmbedder(nn.Module):
         """
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
         half = dim // 2
-        freqs = torch.exp( -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half ).cuda()
+        freqs = torch.exp( -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half )
         args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1).cuda()
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
@@ -106,7 +148,15 @@ def rope_apply(x, grid_sizes, freqs):
 
     # loop over samples
     output = []
-    for i, (f, h, w) in enumerate(grid_sizes.tolist()):
+    # Ensure grid_sizes is contiguous and on CPU
+    grid_sizes = grid_sizes.detach().contiguous().cpu()
+    if not grid_sizes.is_contiguous():
+        grid_sizes = grid_sizes.contiguous()
+    
+    # Directly access tensor values without numpy conversion
+    grid_sizes = grid_sizes.to(torch.float32)
+    grid_list = [(int(f), int(h), int(w)) for f, h, w in grid_sizes.unbind(0)]
+    for i, (f, h, w) in enumerate(grid_list):
         seq_len = f * h * w
 
         # precompute multipliers
@@ -185,13 +235,14 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs):
+    def forward(self, x, seq_lens, grid_sizes, freqs, jvp=False):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
             seq_lens(Tensor): Shape [B]
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            jvp (bool): Whether to use jvp for computing the output.
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
@@ -203,6 +254,8 @@ class WanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
+        
+        # print(f"attentionjvp:{jvp}")
 
         # pdb.set_trace()
         x = flash_attention(
@@ -210,22 +263,26 @@ class WanSelfAttention(nn.Module):
             k=rope_apply(k, grid_sizes, freqs),
             v=v,
             k_lens=seq_lens,
-            window_size=self.window_size)
+            window_size=self.window_size,
+            jvp=jvp)
+        if jvp:
+            x = x.flatten(1)
+        else:
+            x = x.flatten(2)
 
-        # output
-        x = x.flatten(2)
         x = self.o(x)
         return x
 
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens):
+    def forward(self, x, context, context_lens,jvp=False):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
+            jvp (bool): Whether to use jvp for computing the output.
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
@@ -235,10 +292,13 @@ class WanT2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
 
         # compute attention
-        x = flash_attention(q, k, v, k_lens=context_lens)
+        x = flash_attention(q, k, v, k_lens=context_lens,jvp=jvp)
 
-        # output
-        x = x.flatten(2)
+        if jvp:
+            x = x.flatten(1)
+        else:
+            x = x.flatten(2)
+
         x = self.o(x)
         return x
 
@@ -342,6 +402,7 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        jvp=False,
     ):
         r"""
         Args:
@@ -350,6 +411,7 @@ class WanAttentionBlock(nn.Module):
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            jvp (bool): Whether to use jvp for computing the output.
         """
         assert e.dtype == torch.float32
         with amp.autocast(dtype=torch.float32):
@@ -358,21 +420,22 @@ class WanAttentionBlock(nn.Module):
 
         # pdb.set_trace()
         # self-attention
+        # print(f"blockjvp:{jvp}")
         y = self.self_attn(
             self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs)
+            freqs,jvp)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 
         # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens)
+        def cross_attn_ffn(x, context, context_lens, e, jvp):
+            x = x + self.cross_attn(self.norm3(x), context, context_lens,jvp)
             y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
             with amp.autocast(dtype=torch.float32):
                 x = x + y * e[5]
             return x
 
-        x = cross_attn_ffn(x, context, context_lens, e)
+        x = cross_attn_ffn(x, context, context_lens, e,jvp)
         return x
 
 
@@ -485,6 +548,8 @@ class WanModelSCM(ModelMixin, ConfigMixin):
         """
 
         super().__init__()
+        
+  
 
         assert model_type in ['t2v', 'i2v']
         self.model_type = model_type
@@ -503,6 +568,7 @@ class WanModelSCM(ModelMixin, ConfigMixin):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+
 
         # embeddings
         self.patch_embedding = nn.Conv3d(
@@ -538,9 +604,26 @@ class WanModelSCM(ModelMixin, ConfigMixin):
 
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)
+            
+
 
         # initialize weights
         self.init_weights()
+        
+        # 新增层
+        self.logvar_scale_factor = 1.0
+        self.logvar_linear = nn.Linear(self.dim, 1)  # 输出 logvar
+        self.t_embedder = TimestepEmbedder(self.dim)  # 时间步嵌入
+        
+        # 初始化新增层（关键！）
+        self._init_new_layers()
+
+    def _init_new_layers(self):
+        """初始化新增层，避免干扰预训练权重"""
+        nn.init.zeros_(self.logvar_linear.weight)    # 零初始化权重
+        nn.init.constant_(self.logvar_linear.bias, -1.0)  # 初始 logvar ≈ -5
+        
+ 
 
     def forward(
         self,
@@ -584,6 +667,8 @@ class WanModelSCM(ModelMixin, ConfigMixin):
         # TrigFlow --> Flow Transformation
         # the input now is [0, np.pi/2], arctan(N(P_mean, P_std))
         
+                
+  
         
         t = torch.sin(t) / (torch.cos(t) + torch.sin(t))
 
@@ -651,15 +736,18 @@ class WanModelSCM(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens)
         
+
+        
                
 
         block_count = 0
         for block in self.blocks:
-            block.grad_checkpointing = True
-            block.grad_checkpointing_step = 4  # 设置更细粒度的检查点步长
             if jvp:
-                x = block(x, **kwargs)
+                # print(f"jvp:{jvp}")
+                x = block(x, **kwargs,jvp=True)
             else:
+                block.grad_checkpointing = True
+                block.grad_checkpointing_step = 4  # 设置更细粒度的检查点步长
                 x = auto_grad_checkpoint(
                     block,
                     x,
@@ -681,14 +769,15 @@ class WanModelSCM(ModelMixin, ConfigMixin):
         trigflow_model_out = [((1 - 2 * t) * x_i + (1 - 2 * t + 2 * t**2) * model_out_i) / torch.sqrt(t**2 + (1 - t) ** 2)
                              for x_i, model_out_i in zip(x, model_out)]
         
+
         if return_logvar :
             self.logvar_scale_factor = 1.0
-            self.logvar_linear = nn.Linear(self.dim, 1)
             self.logvar_linear.cuda()
-            self.t_embedder = TimestepEmbedder(self.dim)
+            self.t_embedder.cuda()
             t = self.t_embedder(pretrain_timestep).cuda()
             # pdb.set_trace()
             logvar = self.logvar_linear(t) * self.logvar_scale_factor
+            # pdb.set_trace()
             return trigflow_model_out, logvar
         return trigflow_model_out
 
@@ -710,7 +799,15 @@ class WanModelSCM(ModelMixin, ConfigMixin):
 
         c = self.out_dim
         out = []
-        for u, v in zip(x, grid_sizes.tolist()):
+        # Ensure grid_sizes is contiguous and on CPU
+        grid_sizes = grid_sizes.detach().contiguous().cpu()
+        if not grid_sizes.is_contiguous():
+            grid_sizes = grid_sizes.contiguous()
+        
+        # Directly access tensor values without numpy conversion
+        grid_sizes = grid_sizes.to(torch.float32)
+        grid_list = [(int(f), int(h), int(w)) for f, h, w in grid_sizes.unbind(0)]
+        for u, v in zip(x, grid_list):
             u = u[:math.prod(v)].view(*v, *self.patch_size, c)
             u = torch.einsum('fhwpqrc->cfphqwr', u)
             u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])

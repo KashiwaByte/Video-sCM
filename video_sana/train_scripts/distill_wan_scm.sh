@@ -6,7 +6,7 @@ IP=[MASTER NODE IP]
 
 # If you do not have 32 GPUs and to fit in memory, you can: 1. increase sp_size. 2. reduce num_latent_t
 torchrun --nnodes 1 --nproc_per_node 1\
-    --rdzv-endpoint=localhost:29517\
+    --rdzv-endpoint=localhost:29516\
     video_sana/distill_scm.py
     # --data_json_path "/storage/lintaoLab/lintao/botehuang/datasets/demotest/Image-Vid-Finetune-stepvideo/videos2caption.json" \
     # --seed 42\

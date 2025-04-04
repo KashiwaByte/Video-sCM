@@ -287,10 +287,13 @@ def load_transformer(
             transformer = WanModel.from_pretrained(model_folder).to(dtype=torch.bfloat16)
     elif model_type == "wan_scm":
         if dit_model_name_or_path:
-            transformer = WanModelSCM.from_pretrained(dit_model_name_or_path, torch_dtype=master_weight_type)
+            transformer = WanModelSCM.from_pretrained(dit_model_name_or_path, torch_dtype=master_weight_type,
+                                                      low_cpu_mem_usage=False,
+                                                      device_map=None)
         else:
             model_folder = os.path.join(pretrained_model_name_or_path, "transformer")
-            transformer = WanModelSCM.from_pretrained(model_folder).to(dtype=torch.bfloat16)
+            transformer = WanModelSCM.from_pretrained(model_folder,low_cpu_mem_usage=False,
+                                                      device_map=None ).to(dtype=torch.bfloat16)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
     return transformer

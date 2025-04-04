@@ -8,6 +8,7 @@ import time
 from collections import deque
 from copy import deepcopy
 import torch.nn.utils.clip_grad as clip_grad
+from torch.func import jacrev, jvp
 
 import torch
 import torch.distributed as dist
@@ -33,6 +34,9 @@ current_dir = os.path.dirname(current_file_path)
 parent_dir = os.path.dirname(current_dir)
 # 将祖父目录添加到 sys.path 中
 sys.path.append(parent_dir)
+
+print(parent_dir)
+
 
 from fastvideo.dataset.latent_datasets import (LatentDataset, latent_collate_function)
 from fastvideo.models.mochi_hf.mochi_latents_utils import normalize_dit_input
@@ -149,10 +153,16 @@ def distill_one_step(
         def model_wrapper(scaled_x_t, t):
             # Get unwrapped model to avoid FSDP issues with jvp
             unwrapped_transformer = transformer._fsdp_wrapped_module if hasattr(transformer, '_fsdp_wrapped_module') else transformer
-            pred, logvar = unwrapped_transformer(
-                x=scaled_x_t, context=encoder_hidden_states, t=t.flatten(), seq_len=seq_len, return_logvar=True, jvp=True
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            unwrapped_transformer = unwrapped_transformer.to(device)    
+            pred = unwrapped_transformer(
+                x=scaled_x_t, context=encoder_hidden_states, t=t.flatten(), seq_len=seq_len, return_logvar=False, jvp=True
             )
-            return pred, logvar
+        
+            if isinstance(pred, list):
+                pred = tuple(pred)
+            return pred
+
         
 
         
@@ -169,27 +179,21 @@ def distill_one_step(
                 "context": encoder_hidden_states,
                 "t": t.flatten(),
                 "seq_len": seq_len,
-                "return_logvar": True,
-                "jvp": True
+                "return_logvar": False,
+                "jvp": False
             }
+
             
             # Calculate v_x and v_t for jvp
             with torch.no_grad():
                 print("教师模型开始计算")
-                pretrain_pred = teacher_transformer(**model_kwargs)[0]
+                pretrain_pred = teacher_transformer(**model_kwargs)
+                # pdb.set_trace()
             pretrain_pred = pretrain_pred[0]
+            
             dxt_dt = sigma_data * pretrain_pred
             v_x = torch.cos(t) * torch.sin(t) * dxt_dt / sigma_data
             v_t = torch.cos(t) * torch.sin(t)
-            
-            # Remove debug breakpoint
-            # pdb.set_trace()
-            
-            # Calculate F_theta using jvp
-            # with torch.no_grad():
-            #     F_theta, F_theta_grad, logvar = torch.func.jvp(
-            #                     model_wrapper, (x_t / sigma_data, t), (v_x, v_t), has_aux=True
-            #                 )
             
             print("学生模型开始计算")
             F_theta, logvar = transformer(
@@ -200,8 +204,45 @@ def distill_one_step(
                 return_logvar=True,
                 jvp=False
             )
+            
+            print(f"logvar{logvar}")
+            
+            # Remove debug breakpoint
+            # pdb.set_trace()
+            
+            # Calculate F_theta using jvp
+            # with torch.no_grad():
+            #     F_theta, F_theta_grad, logvar = torch.func.jvp(
+            #                     model_wrapper, (x_t / sigma_data, t), (v_x, v_t), has_aux=True
+            #                 )
+                
+            print("雅可比矩阵开始计算")  
+            primals = (x_t / sigma_data, t)
+
+
+            # jac = torch.autograd.functional.jacobian(model_wrapper, primals)
+            # pdb.set_trace()
+            # with torch.no_grad():
+            #     F_theta_jvp, F_theta_grad = torch.func.jvp(
+            #                     model_wrapper, (x_t / sigma_data, t), (v_x, v_t), has_aux=False
+            #                 )
+                
+            #     print(f"F_theta_grad{F_theta_grad[0].shape}")
+            #     print(f"F_theta{F_theta[0].shape}")
+            
+            # print("学生模型开始计算")
+            # F_theta, logvar = transformer(
+            #     x=x_t / sigma_data,
+            #     context=encoder_hidden_states,
+            #     t=t.flatten(),
+            #     seq_len=seq_len,
+            #     return_logvar=True,
+            #     jvp=False
+            # )
+            
             # Clone F_theta to avoid modifying the view
             
+            # logvar = torch.randn(1).cuda()
             logvar = logvar.view(-1, 1, 1, 1, 1)
             F_theta = F_theta[0]
             F_theta = F_theta.clone()
@@ -228,6 +269,7 @@ def distill_one_step(
             
             # Calculate loss with normalization factor
             loss = (weight / torch.exp(logvar)) * l2_loss + logvar
+            # pdb.set_trace()
             loss = loss.mean() / gradient_accumulation_steps
             
             
@@ -664,7 +706,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-6,
+        default=1e-1,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
