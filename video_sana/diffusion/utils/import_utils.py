@@ -22,8 +22,8 @@ _triton_modules_available = importlib.util.find_spec("triton") is not None
 try:
     if _triton_modules_available:
         _triton_version = importlib_metadata.version("triton")
-        if version.Version(_triton_version) < version.Version("3.0.0"):
-            raise ValueError("triton is installed but requires Triton >= 3.0.0")
+        if version.Version(_triton_version) < version.Version("2.3.0"):
+            raise ValueError("triton is installed but requires Triton >= 2.3.0")
         logger.debug(f"Successfully imported triton version {_triton_version}")
 except ImportError:
     _triton_modules_available = False
