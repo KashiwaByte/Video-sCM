@@ -30,46 +30,7 @@ def auto_grad_checkpoint(module, x, **kwargs):
             return checkpoint(module, x, e, seq_lens, grid_sizes, freqs, context, context_lens)
     return module(x, **kwargs)
 
-# class TimestepEmbedder(nn.Module):
-#     """
-#     Embeds scalar timesteps into vector representations.
-#     """
 
-#     def __init__(self, hidden_size, frequency_embedding_size=256):
-#         super().__init__()
-#         self.mlp = nn.Sequential( nn.Linear(frequency_embedding_size, hidden_size, bias=True).cuda(), nn.SiLU(), nn.Linear(hidden_size, hidden_size, bias=True).cuda(), )
-#         self.frequency_embedding_size = frequency_embedding_size
-
-#     @staticmethod
-#     def timestep_embedding(t, dim, max_period=10000):
-#         """
-#         Create sinusoidal timestep embeddings.
-#         :param t: a 1-D Tensor of N indices, one per batch element.
-#                           These may be fractional.
-#         :param dim: the dimension of the output.
-#         :param max_period: controls the minimum frequency of the embeddings.
-#         :return: an (N, D) Tensor of positional embeddings.
-#         """
-#         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-#         half = dim // 2
-#         freqs = torch.exp( -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half ).cuda()
-#         args = t[:, None].float() * freqs[None]
-#         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1).cuda()
-#         if dim % 2:
-#             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-#         return embedding
-
-#     def forward(self, t):
-#         t_freq = self.timestep_embedding(t, self.frequency_embedding_size).to(self.dtype)
-#         t_emb = self.mlp(t_freq)
-#         return t_emb
-
-#     @property
-#     def dtype(self):
-#         try:
-#             return next(self.parameters()).dtype
-#         except StopIteration:
-#             return torch.float32
 
 
 class TimestepEmbedder(nn.Module):
@@ -619,9 +580,9 @@ class WanModelSCM(ModelMixin, ConfigMixin):
         self._init_new_layers()
 
     def _init_new_layers(self):
-        """初始化新增层，避免干扰预训练权重"""
-        nn.init.zeros_(self.logvar_linear.weight)    # 零初始化权重
-        nn.init.constant_(self.logvar_linear.bias, -1.0)  # 初始 logvar ≈ -5
+        """初始化新增层，避免干扰预训练权重,初始化方式参考SANA-Sprint"""
+        nn.init.xavier_uniform_(self.logvar_linear.weight)       
+        nn.init.constant_(self.logvar_linear.bias, 0.0)  # 初始 logvar ≈ 0
         
  
 
@@ -775,9 +736,7 @@ class WanModelSCM(ModelMixin, ConfigMixin):
             self.logvar_linear.cuda()
             self.t_embedder.cuda()
             t = self.t_embedder(pretrain_timestep).cuda()
-            # pdb.set_trace()
             logvar = self.logvar_linear(t) * self.logvar_scale_factor
-            # pdb.set_trace()
             return trigflow_model_out, logvar
         return trigflow_model_out
 

@@ -12,6 +12,8 @@ from torch.func import jacrev, jvp
 
 import torch
 import torch.distributed as dist
+import faulthandler
+faulthandler.enable()
 import swanlab
 from accelerate.utils import set_seed
 from diffusers.optimization import get_scheduler
@@ -152,10 +154,14 @@ def distill_one_step(
         
         def model_wrapper(scaled_x_t, t):
             # Get unwrapped model to avoid FSDP issues with jvp
-            unwrapped_transformer = transformer._fsdp_wrapped_module if hasattr(transformer, '_fsdp_wrapped_module') else transformer
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            unwrapped_transformer = unwrapped_transformer.to(device)    
-            pred = unwrapped_transformer(
+            # unwrapped_transformer = transformer._fsdp_wrapped_module if hasattr(transformer, '_fsdp_wrapped_module') else transformer
+            # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # unwrapped_transformer = unwrapped_transformer.to(device)    
+            # pred = unwrapped_transformer(
+            #     x=scaled_x_t, context=encoder_hidden_states, t=t.flatten(), seq_len=seq_len, return_logvar=False, jvp=True
+            # )
+            
+            pred = transformer(
                 x=scaled_x_t, context=encoder_hidden_states, t=t.flatten(), seq_len=seq_len, return_logvar=False, jvp=True
             )
         
@@ -173,6 +179,7 @@ def distill_one_step(
                           target_shape[1] / sp_size) * sp_size
         
         # Predict using transformer
+        # pdb.set_trace()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             model_kwargs = {
                 "x": x_t / sigma_data,
@@ -195,17 +202,17 @@ def distill_one_step(
             v_x = torch.cos(t) * torch.sin(t) * dxt_dt / sigma_data
             v_t = torch.cos(t) * torch.sin(t)
             
-            print("学生模型开始计算")
-            F_theta, logvar = transformer(
-                x=x_t / sigma_data,
-                context=encoder_hidden_states,
-                t=t.flatten(),
-                seq_len=seq_len,
-                return_logvar=True,
-                jvp=False
-            )
+            # print("学生模型开始计算")
+            # F_theta, logvar = transformer(
+            #     x=x_t / sigma_data,
+            #     context=encoder_hidden_states,
+            #     t=t.flatten(),
+            #     seq_len=seq_len,
+            #     return_logvar=True,
+            #     jvp=False
+            # )
             
-            print(f"logvar{logvar}")
+            # print(f"logvar{logvar}")
             
             # Remove debug breakpoint
             # pdb.set_trace()
@@ -222,23 +229,23 @@ def distill_one_step(
 
             # jac = torch.autograd.functional.jacobian(model_wrapper, primals)
             # pdb.set_trace()
-            # with torch.no_grad():
-            #     F_theta_jvp, F_theta_grad = torch.func.jvp(
-            #                     model_wrapper, (x_t / sigma_data, t), (v_x, v_t), has_aux=False
-            #                 )
+            with torch.no_grad():
+                F_theta, F_theta_grad = torch.func.jvp(
+                                model_wrapper, (x_t / sigma_data, t), (v_x, v_t), has_aux=False
+                            )
                 
-            #     print(f"F_theta_grad{F_theta_grad[0].shape}")
-            #     print(f"F_theta{F_theta[0].shape}")
+                print(f"F_theta_grad{F_theta_grad[0].shape}")
+                print(f"F_theta{F_theta[0].shape}")
             
-            # print("学生模型开始计算")
-            # F_theta, logvar = transformer(
-            #     x=x_t / sigma_data,
-            #     context=encoder_hidden_states,
-            #     t=t.flatten(),
-            #     seq_len=seq_len,
-            #     return_logvar=True,
-            #     jvp=False
-            # )
+            print("学生模型开始计算")
+            F_theta, logvar = transformer(
+                x=x_t / sigma_data,
+                context=encoder_hidden_states,
+                t=t.flatten(),
+                seq_len=seq_len,
+                return_logvar=True,
+                jvp=False
+            )
             
             # Clone F_theta to avoid modifying the view
             
@@ -246,7 +253,8 @@ def distill_one_step(
             logvar = logvar.view(-1, 1, 1, 1, 1)
             F_theta = F_theta[0]
             F_theta = F_theta.clone()
-            F_theta_grad = torch.randn(1, 16, 21, 60, 104).cuda()
+            # F_theta_grad = torch.randn(1, 16, 21, 60, 104).cuda()
+            F_theta_grad = F_theta_grad[0] 
             F_theta_grad = F_theta_grad.view_as(F_theta).detach()
             F_theta_minus = F_theta.detach()
             
@@ -270,7 +278,7 @@ def distill_one_step(
             # Calculate loss with normalization factor
             loss = (weight / torch.exp(logvar)) * l2_loss + logvar
             # pdb.set_trace()
-            loss = loss.mean() / gradient_accumulation_steps
+            loss = loss.mean() 
             
             
             loss_no_logvar = weight * torch.square(F_theta - F_theta_minus - g)
@@ -278,7 +286,7 @@ def distill_one_step(
             loss_no_weight = l2_loss.mean()
             g_norm = g_norm.mean()
             
-        
+        # pdb.set_trace()
         # Calculate model prediction norms
         get_norm(F_theta.detach().float(), model_pred_norm, gradient_accumulation_steps)
         loss.backward()
@@ -293,7 +301,7 @@ def distill_one_step(
     optimizer.step()
     lr_scheduler.step()
 
-    return total_loss, grad_norm.item(), model_pred_norm
+    return total_loss, grad_norm.item(), model_pred_norm,loss_no_weight,loss_no_logvar
 
 
 def main(args):
@@ -358,14 +366,15 @@ def main(args):
         transformer._no_split_modules = no_split_modules
         fsdp_kwargs["auto_wrap_policy"] = fsdp_kwargs["auto_wrap_policy"](transformer)
 
-    transformer = FSDP(
-        transformer,
-        **fsdp_kwargs,
-    )
-    teacher_transformer = FSDP(
-        teacher_transformer,
-        **fsdp_kwargs,
-    )
+    # transformer = FSDP(
+    #     transformer,
+    #     **fsdp_kwargs,
+    # )
+    
+    # teacher_transformer = FSDP(
+    #     teacher_transformer,
+    #     **fsdp_kwargs,
+    # )
     
     transformer = transformer.cuda()
     teacher_transformer = teacher_transformer.cuda()
@@ -440,7 +449,7 @@ def main(args):
 
     if rank <= 0:
         project = args.tracker_project_name or "fastvideo"
-        swanlab.init(project='distill', config=args , mode='disabled',logdir="/storage/lintaoLab/lintao/botehuang")
+        swanlab.init(project='distill', config=args , mode='cloud',logdir="/home/tempuser11/botehuang/swanlab")
 
     total_batch_size = (world_size * args.gradient_accumulation_steps / args.sp_size * args.train_sp_batch_size)
     main_print("***** Running training *****")
@@ -484,7 +493,7 @@ def main(args):
                 continue
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss, grad_norm, model_pred_norm = distill_one_step(
+                loss, grad_norm, model_pred_norm,loss_no_weight,loss_no_logvar = distill_one_step(
                     transformer=transformer,
                     model_type=args.model_type,
                     teacher_transformer=teacher_transformer,
@@ -509,9 +518,12 @@ def main(args):
 
             logs = {
                 "loss": loss,
+                "loss_no_weight":loss_no_weight,
+                "loss_no_logvar":loss_no_logvar,
                 "lr": lr_scheduler.get_last_lr()[0],
                 "grad_norm": grad_norm,
                 "step": global_step,
+    
             }
             logs.update(model_pred_norm)
             progress_bar.update(1)
@@ -529,7 +541,6 @@ def main(args):
                         global_step,
                     )
 
-            global_step += 1
 
     destroy_sequence_parallel_group()
 
@@ -622,7 +633,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=4,
+        default=16,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument("--num_latent_t", type=int, default=32, help="Number of latent timesteps.")
@@ -706,7 +717,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-1,
+        default=1e-6,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(

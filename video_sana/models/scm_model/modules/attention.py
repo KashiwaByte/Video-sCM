@@ -43,7 +43,7 @@ def manual_varlen_attention(
     softmax_scale=None,
     causal=False,
     deterministic=True,
-    block_size=256  # 可调整的分块大小
+    block_size=2048 # 可调整的分块大小
 ):
     batch_size = cu_seqlens_q.size(0) - 1
     num_heads = q.size(1)
