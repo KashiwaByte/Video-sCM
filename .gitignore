@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Gen File
+video_gen/
