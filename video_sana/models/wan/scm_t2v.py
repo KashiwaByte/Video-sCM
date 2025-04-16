@@ -22,6 +22,7 @@ for _ in range(up_levels):
 sys.path.append(current_file_path)
 
 from video_sana.diffusion import SCMScheduler
+from video_sana.models.scm_model.wan_scm import WanModelSCM
 
 from .distributed.fsdp import shard_model
 from .modules.model import WanModel
@@ -38,12 +39,14 @@ class WanT2V_SCM:
         self,
         config,
         checkpoint_dir,
+        wanmodel_dir,
         device_id=0,
         rank=0,
         t5_fsdp=False,
         dit_fsdp=False,
         use_usp=False,
         t5_cpu=False,
+        use_scm=False,
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -88,9 +91,20 @@ class WanT2V_SCM:
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
+        
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        if wanmodel_dir:
+            if use_scm:
+                logging.info(f"Creating WanModel_SCM from {wanmodel_dir} ")
+                self.model = WanModelSCM.from_pretrained(wanmodel_dir)
+                logging.info(f"Create WanModel_SCM from wanmodel_dir success")
+            else:
+                logging.info(f"Creating WanModel from {wanmodel_dir} ")
+                self.model = WanModel.from_pretrained(wanmodel_dir)
+                logging.info(f"Create WanModelfrom wanmodel_dir success")
+        else: 
+            logging.info(f"Creating WanModel from  {checkpoint_dir}")
+            self.model = WanModel.from_pretrained(checkpoint_dir)
         self.model.eval().requires_grad_(False)
 
         if use_usp:
@@ -202,8 +216,8 @@ class WanT2V_SCM:
                 target_shape[3],
                 dtype=torch.float32,
                 device=self.device,
-                generator=seed_g)
-        ] * sigma_data
+                generator=seed_g) * sigma_data
+        ]
 
         @contextmanager
         def noop_no_sync():
@@ -235,7 +249,7 @@ class WanT2V_SCM:
             elif sample_solver == 'scm':
                 sample_scheduler = SCMScheduler()
                 sample_scheduler.set_timesteps(
-                    num_inference_steps=sample_steps,
+                    num_inference_steps=sampling_steps,
                     max_timesteps= 1.57080,
                     intermediate_timesteps=intermediate_timesteps,
                     device=self.device,
@@ -246,27 +260,28 @@ class WanT2V_SCM:
 
             # sample videos
             latents = noise
+            print(latents[0].shape)
+            print(timesteps)
 
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
 
 
-            
-            for i, t in enumerate(tqdm(timesteps)):
-                latent_model_input = latents
-                timestep = [t]
+            if sample_solver == 'scm':
+                for i, t in enumerate(tqdm(timesteps[:-1])):
+                    latent_model_input = latents
+                    timestep = [t]
 
-                timestep = torch.stack(timestep)
+                    timestep = torch.stack(timestep)
 
-                self.model.to(self.device)
-                noise_pred_cond = sigma_data * self.model(
-                    latent_model_input /sigma_data , t=timestep, **arg_c)[0]
-                noise_pred_uncond = sigma_data * self.model(
-                    latent_model_input / sigma_data , t=timestep, **arg_null)[0]
+                    self.model.to(self.device)
+                    noise_pred_cond = sigma_data * self.model(
+                        [latent_model_input[0] /sigma_data] , t=timestep, **arg_c)[0]
+                    noise_pred_uncond = sigma_data * self.model(
+                        [latent_model_input[0] /sigma_data] , t=timestep, **arg_null)[0]
 
-                noise_pred = noise_pred_uncond + guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
-                if sample_solver == 'scm':
+                    noise_pred = noise_pred_uncond + guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
                     temp_x0 = sample_scheduler.step(
                         noise_pred.unsqueeze(0),
                         i,
@@ -275,21 +290,45 @@ class WanT2V_SCM:
                         return_dict=False,
                         sigma_data=sigma_data,
                         generator=seed_g)[0]
-                else:
+                    latents = [temp_x0.squeeze(0)]
+
+                x0 = [latents[0]/sigma_data] 
+                if offload_model:
+                    self.model.cpu()
+                    torch.cuda.empty_cache()
+                if self.rank == 0:
+                    videos = self.vae.decode(x0)
+            
+            else:    
+                for _, t in enumerate(tqdm(timesteps)):
+                    latent_model_input = latents
+                    timestep = [t]
+
+                    timestep = torch.stack(timestep)
+
+                    self.model.to(self.device)
+                    noise_pred_cond = self.model(
+                        latent_model_input, t=timestep, **arg_c)[0]
+                    noise_pred_uncond = self.model(
+                        latent_model_input, t=timestep, **arg_null)[0]
+
+                    noise_pred = noise_pred_uncond + guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
+
                     temp_x0 = sample_scheduler.step(
                         noise_pred.unsqueeze(0),
                         t,
                         latents[0].unsqueeze(0),
                         return_dict=False,
                         generator=seed_g)[0]
-                latents = [temp_x0.squeeze(0)]
+                    latents = [temp_x0.squeeze(0)]
 
-            x0 = latents/sigma_data 
-            if offload_model:
-                self.model.cpu()
-                torch.cuda.empty_cache()
-            if self.rank == 0:
-                videos = self.vae.decode(x0)
+                x0 = latents
+                if offload_model:
+                    self.model.cpu()
+                    torch.cuda.empty_cache()
+                if self.rank == 0:
+                    videos = self.vae.decode(x0)        
 
         del noise, latents
         del sample_scheduler

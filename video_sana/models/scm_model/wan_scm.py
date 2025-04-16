@@ -11,7 +11,7 @@ from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 
 
 
-from models.scm_model.modules.attention import flash_attention
+from .modules.attention import flash_attention
 
 __all__ = ['WanModel']
 

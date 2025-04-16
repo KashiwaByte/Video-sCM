@@ -29,6 +29,7 @@ class WanT2V:
         self,
         config,
         checkpoint_dir,
+        wanmodel_dir,
         device_id=0,
         rank=0,
         t5_fsdp=False,
@@ -80,8 +81,15 @@ class WanT2V:
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
             device=self.device)
 
-        logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = WanModel.from_pretrained(checkpoint_dir)
+        
+        if wanmodel_dir:
+            logging.info(f"Creating WanModel from {wanmodel_dir} ")
+            self.model = WanModel.from_pretrained(wanmodel_dir)
+            logging.info(f"Create WanModelfrom wanmodel_dir success")
+        else: 
+            logging.info(f"Creating WanModel from  {checkpoint_dir}")
+            self.model = WanModel.from_pretrained(checkpoint_dir)
+            logging.info(f"Create WanModel success")
         self.model.eval().requires_grad_(False)
 
         if use_usp:
@@ -222,6 +230,8 @@ class WanT2V:
 
             # sample videos
             latents = noise
+            print(latents[0].shape)
+            print(timesteps)
 
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
