@@ -792,6 +792,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
+
     @staticmethod
     def forward(
         q,
@@ -814,12 +815,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # is_grad = is_grad_enabled and any(x.requires_grad for x in [q, k, v])
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
-        head_size_og = q.size(2)
-        if head_size_og % 8 != 0:
-            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
-            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
-            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        
+
         out, q, k, v, out_padded, softmax_lse, S_dmask, rng_state  = _flash_attn_varlen_forward(
             q,
             k,
@@ -838,12 +834,16 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             block_table=block_table,
         )
         
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
+        # return out if not return_softmax else (out, softmax_lse, S_dmask)
         
-        out = out_padded[..., :head_size_og]
+        # return (out,out_padded,softmax_lse ,rng_state)  if not return_softmax else (out,out_padded,softmax_lse ,rng_state,S_dmask)
+    
+        return  (out,out_padded,softmax_lse,rng_state,S_dmask)
+        
+        # out = out_padded[..., :head_size_og]
  
 
-        return out if not return_softmax else (out, softmax_lse, S_dmask)
+        # return out if not return_softmax else (out, softmax_lse, S_dmask)
 
         
         # return out if not return_softmax else (out, softmax_lse, S_dmask), (
@@ -851,36 +851,27 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         #     dropout_p, softmax_scale, causal, window_size, softcap,
         #     alibi_slopes, deterministic, return_softmax, block_table,
         # )
+        
+        
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        # 确保我们总是从forward返回的tuple中获取正确的值
-        if isinstance(output, tuple):
-            if len(output) == 2:
-                out, saved_tensors = output
-            else:
-                out = output[0]
-                saved_tensors = inputs
-        else:
-            out = output
-            saved_tensors = inputs
-
-        # 处理out可能是tuple的情况
-        if isinstance(out, tuple):
-            out, softmax_lse, S_dmask = out
-        else:
-            softmax_lse = None
-            S_dmask = None
-
-        # 从saved_tensors中提取所需的值
         (q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
          dropout_p, softmax_scale, causal, window_size, softcap,
          alibi_slopes, deterministic, return_softmax, block_table,
-         ) = saved_tensors
+         ) = inputs
         
+        (out,out_padded,softmax_lse,rng_state,S_dmask) = output
+
+
         # 确保所有需要的张量都被正确保存
-        ctx.save_for_forward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, S_dmask)
-        ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, S_dmask)
+        ctx.save_for_forward( q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            out)
+        ctx.save_for_backward( q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state)
         ctx.dropout_p = dropout_p
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
@@ -890,108 +881,173 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.alibi_slopes = alibi_slopes
         ctx.deterministic = deterministic
+        ctx.return_softmax  = return_softmax
+        ctx.block_table = block_table
 
     @staticmethod
     def jvp(ctx, *tangents):
-        return tangents[:1]       
+        pdb.set_trace()
         # # Get the saved tensors from setup_context
-        # q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, S_dmask = ctx.saved_tensors
+        q, k, v, cu_seqlens_q, cu_seqlens_k,out = ctx.saved_tensors
         # # Get other parameters from ctx
-        # dropout_p = ctx.dropout_p
-        # max_seqlen_q = ctx.max_seqlen_q
-        # max_seqlen_k = ctx.max_seqlen_k
-        # softmax_scale = ctx.softmax_scale
-        # causal = ctx.causal
-        # window_size = ctx.window_size
-        # softcap = ctx.softcap
-        # alibi_slopes = ctx.alibi_slopes
-        # deterministic = ctx.deterministic
-        # return_softmax = False  # Default to False for jvp
-        # block_table = None  # Default to None for jvp
+        dropout_p = ctx.dropout_p
+        max_seqlen_q = ctx.max_seqlen_q
+        max_seqlen_k = ctx.max_seqlen_k
+        softmax_scale = ctx.softmax_scale
+        causal = ctx.causal
+        window_size = ctx.window_size
+        softcap = ctx.softcap
+        alibi_slopes = ctx.alibi_slopes
+        deterministic = ctx.deterministic
+        return_softmax = ctx.return_softmax # Default to False for jvp
+        block_table = ctx.block_table  # Default to None for jvp
 
-        # pdb.set_trace()
-        # # Get tangents for q, k, v
-        # dq, dk, dv = tangents[:3]
-        # if dq is None or dk is None or dv is None:
-        #     return None
 
-        # # Apply padding if necessary
-        # head_size_og = q.size(2)
-        # if head_size_og % 8 != 0:
-        #     dq = torch.nn.functional.pad(dq, [0, 8 - head_size_og % 8])
-        #     dk = torch.nn.functional.pad(dk, [0, 8 - head_size_og % 8])
-        #     dv = torch.nn.functional.pad(dv, [0, 8 - head_size_og % 8])
 
-        # # Compute forward pass with tangents following JVP principle
-        # # JVP requires computing the directional derivative in the direction of the tangent vectors
-        # # We need to consider all input tangents (dq, dk, dv)
-        # dq, dk, dv = [maybe_contiguous(x) for x in (dq, dk, dv)]
-        # q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+
+        # Compute forward pass with tangents following JVP principle
+        # JVP requires computing the directional derivative in the direction of the tangent vectors
+        # We need to consider all input tangents (dq, dk, dv)
+
         
-        # # 参考flashscm2.7.py中的实现，只计算dq的贡献
-        # # 确保所有输入张量都是连续的，以避免存储问题
-        # dq = dq.contiguous() if dq is not None else None
-        # k = k.contiguous() if k is not None else None
-        # v = v.contiguous() if v is not None else None
         
-        # # 使用深度复制创建新的张量，避免存储问题
-        # # 这里只复制必要的张量，减少内存使用
-        # dq_copy = dq.clone() if dq is not None else None
+
         
-        # # 使用复制的张量进行前向传播计算
-        # # 注意：我们只传递dq的副本，而k和v使用原始张量
-        # # 这样可以避免"Cannot access data pointer of Tensor that doesn't have storage"错误
-        # try:
-        #     out_tangent, _, _, _, _, _, _, _ = _flash_attn_varlen_forward(
-        #         dq_copy,
-        #         k,
-        #         v,
-        #         cu_seqlens_q,
-        #         cu_seqlens_k,
-        #         max_seqlen_q,
-        #         max_seqlen_k,
-        #         dropout_p,
-        #         softmax_scale,
-        #         causal=causal,
-        #         window_size=window_size,
-        #         softcap=softcap,
-        #         alibi_slopes=alibi_slopes,
-        #         return_softmax=return_softmax,
-        #         block_table=block_table
-        #     )
-        # except RuntimeError as e:
-        #     # 如果仍然出现错误，尝试复制所有输入张量
-        #     if "Cannot access data pointer of Tensor that doesn't have storage" in str(e):
-        #         k_copy = k.clone() if k is not None else None
-        #         v_copy = v.clone() if v is not None else None
-                
-        #         out_tangent, _, _, _, _, _, _, _ = _flash_attn_varlen_forward(
-        #             dq_copy,
-        #             k_copy,
-        #             v_copy,
-        #             cu_seqlens_q,
-        #             cu_seqlens_k,
-        #             max_seqlen_q,
-        #             max_seqlen_k,
-        #             dropout_p,
-        #             softmax_scale,
-        #             causal=causal,
-        #             window_size=window_size,
-        #             softcap=softcap,
-        #             alibi_slopes=alibi_slopes,
-        #             return_softmax=return_softmax,
-        #             block_table=block_table
-        #         )
-        #     else:
-        #         # 如果是其他错误，则重新抛出
-        #         raise
+
+        pdb.set_trace()
+
+        primals = (q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            softcap,
+            alibi_slopes,
+            return_softmax,
+            block_table
+        )
+        tangents = tangents
+        
+        
+        q, k, v, cu_seqlens_q, cu_seqlens_k,out = ctx.saved_tensors
+        
+        # 2. 获取tangents
+        dq, dk, dv = tangents[:3]
+        if dq is None or dk is None or dv is None:
+            return None
+            
+        
+        # 3. 确保tensors连续性
+        dq, dk, dv = [maybe_contiguous(x) for x in (dq, dk, dv)]
+        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+        
+        def unwrap_if_needed(t):
+            if hasattr(t, '_base'):  # Common in wrapped tensors
+                return t._base
+            if hasattr(t, 'tensor'):  # Other wrapper types
+                return t.tensor
+            return t
+        
+        
+    
+        dq, dk, dv = dq.clone() , dq.clone(), dv.clone()
+        q, k, v = q.clone(), k.clone(), v.clone()
+        pdb.set_trace()
+        
+        alibi_slopes=None
+        return_softmax=False
+        block_table=None
+        leftpad_k=None
+        seqused_k=None
+
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        # 分别计算三个方向的JVP
+        # 对q的贡献
+        out_q, _, _, _, out_padded_k, softmax_lse_k, S_dmask_k, rng_state_k = _flash_attn_varlen_forward(
+            dq, k, v,
+            cu_seqlens_q, cu_seqlens_k,
+            ctx.max_seqlen_q, ctx.max_seqlen_k,
+            ctx.dropout_p, softmax_scale,
+            causal=ctx.causal,
+            window_size=ctx.window_size,
+            softcap=ctx.softcap,
+            alibi_slopes=ctx.alibi_slopes,
+            return_softmax=ctx.return_softmax and ctx.dropout_p > 0,
+            block_table=ctx.block_table
+        )
+            
+
+        
+        # 对k的贡献
+        out_k, _, _, _, out_padded_k, softmax_lse_k, S_dmask_k, rng_state_k = _flash_attn_varlen_forward(
+            q, dk, v,
+            cu_seqlens_q, cu_seqlens_k,
+            ctx.max_seqlen_q, ctx.max_seqlen_k,
+            ctx.dropout_p, softmax_scale,
+            causal=ctx.causal,
+            window_size=ctx.window_size,
+            softcap=ctx.softcap,
+            alibi_slopes=ctx.alibi_slopes,
+            return_softmax=ctx.return_softmax and ctx.dropout_p > 0,
+            block_table=ctx.block_table
+        )
+        
+        
+
+        
+        # 对v的贡献
+        out_v, _, _, _, out_padded_v, softmax_lse_v, S_dmask_v, rng_state_v = _flash_attn_varlen_forward(
+            q, k, dv,
+            cu_seqlens_q, cu_seqlens_k,
+            ctx.max_seqlen_q, ctx.max_seqlen_k,
+            ctx.dropout_p, softmax_scale,
+            causal=ctx.causal,
+            window_size=ctx.window_size,
+            softcap=ctx.softcap,
+            alibi_slopes=ctx.alibi_slopes,
+            return_softmax=ctx.return_softmax and ctx.dropout_p > 0,
+            block_table=ctx.block_table
+        )
+        
+        # 合并所有贡献
+        jvp_out = out_q + out_k + out_v
+        jvp_out_padded = out_padded_q + out_padded_k + out_padded_v
+        jvp_softmax_lse = softmax_lse_q + softmax_lse_k + softmax_lse_v
+        jvp_S_dmask = S_dmask_q + S_dmask_k + S_dmask_v if S_dmask_q is not None else None
+        
+        # 返回与forward相同格式的结果
+        return (jvp_out, jvp_out_padded, jvp_softmax_lse, rng_state_q, jvp_S_dmask)
+        
+        
+
+        # out_tangent, _, _, _, _, _, _, _ = _flash_attn_varlen_forward(
+        #     dq,
+        #     k,
+        #     v,
+        #     cu_seqlens_q,
+        #     cu_seqlens_k,
+        #     max_seqlen_q,
+        #     max_seqlen_k,
+        #     dropout_p,
+        #     softmax_scale,
+        #     causal=causal,
+        #     window_size=window_size,
+        #     softcap=softcap,
+        #     alibi_slopes=alibi_slopes,
+        #     return_softmax=return_softmax,
+        #     block_table=block_table
+        # )
 
 
 
 
-        # # Remove padding if necessary
-        # if head_size_og % 8 != 0:
-        #     out_tangent = out_tangent[..., :head_size_og]
 
         # # Return None for all other tangents
         # return_values = [out_tangent] + [None]
@@ -1003,12 +1059,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
-        head_size_og = dout.size(2)
-        dout_padded = dout
-        if head_size_og % 8 != 0:
-            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
+
         _flash_attn_varlen_backward(
-            dout_padded,
+            dout,
             q,
             k,
             v,

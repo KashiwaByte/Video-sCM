@@ -56,7 +56,6 @@ from diffusion.model.respace import compute_density_for_timestep_sampling
 
 from models.wan.modules.t5 import T5EncoderModel
 
-from torch.utils.tensorboard import SummaryWriter
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.31.0")
@@ -107,7 +106,6 @@ def distill_one_step(
     hunyuan_teacher_disable_cfg,
     global_step,
     text_encoder,
-    writer,
 
 ):
     total_loss = 0.0
@@ -126,9 +124,9 @@ def distill_one_step(
             encoder_attention_mask,
         ) = next(loader)
         sigma_data=args.sigma_data
-        model_input= normalize_dit_input(model_type, latents)
-        x0 = model_input * sigma_data
-        bsz = x0.shape[0]
+        model_input = normalize_dit_input(model_type, latents)
+        noise = torch.randn_like(model_input)*sigma_data
+        bsz = model_input.shape[0]
         
         # Sample timesteps for SCM training
         if args.weighting_scheme == "logit_normal_trigflow":
@@ -139,25 +137,25 @@ def distill_one_step(
                 logit_std=args.logit_std,
                 mode_scale=None,
             )
-            timesteps = u.float().to(x0.device)
+            timesteps = u.float().to(model_input.device)
         elif args.weighting_scheme == "logit_normal_trigflow_ladd":
             indices = torch.randint(0, len(args.add_noise_timesteps), (bsz,))
             u = torch.tensor([args.add_noise_timesteps[i] for i in indices])
             if len(args.add_noise_timesteps) == 1:
                 # zero-SNR
-                timesteps = torch.tensor([1.57080 for i in indices]).float().to(x0.device)
+                timesteps = torch.tensor([1.57080 for i in indices]).float().to(model_input.device)
             else:
-                timesteps = u.float().to(x0.device)
+                timesteps = u.float().to(model_input.device)
         else:
             # Default random sampling
-            timesteps = torch.rand(bsz, device=x0.device) * 1.57080  # pi/2
+            timesteps = torch.rand(bsz, device=model_input.device) * 1.57080  # pi/2
                 
         t = timesteps.view(-1, 1, 1, 1, 1)
     
     
         # Add noise according to SCM
-        z = torch.randn_like(x0) * sigma_data
-        x_t = torch.cos(t) * x0 + torch.sin(t) * z
+        z = torch.randn_like(model_input) * sigma_data
+        x_t = torch.cos(t) * model_input + torch.sin(t) * z
         # pdb.set_trace()
         
         def model_wrapper(scaled_x_t, t):
@@ -219,32 +217,34 @@ def distill_one_step(
                     "jvp": False
                 }
                 
-                with torch.no_grad():
-                    print("教师模型CFG预测开始")
-                    pretrain_pred_cond = teacher_transformer(**model_kwargs)[0]
-                    pretrain_pred_uncond = teacher_transformer(**uncond_cfg_model_kwargs)[0]
-                    # pdb.set_trace()
+            #     with torch.no_grad():
+            #         print("教师模型CFG预测开始")
+            #         pretrain_pred_cond = teacher_transformer(**model_kwargs)[0]
+            #         pretrain_pred_uncond = teacher_transformer(**uncond_cfg_model_kwargs)[0]
+            #         # pdb.set_trace()
 
-                    # 应用CFG
-                    pretrain_pred =  pretrain_pred_uncond  + distill_cfg * (pretrain_pred_cond - pretrain_pred_uncond)
-            else:
-                with torch.no_grad():
-                    print("教师模型开始计算")
-                    pretrain_pred = teacher_transformer(**model_kwargs)
-                    pretrain_pred = pretrain_pred[0]
+            #         # 应用CFG
+            #         pretrain_pred =  pretrain_pred_uncond  + distill_cfg * (pretrain_pred_cond - pretrain_pred_uncond)
+            # else:
+            #     with torch.no_grad():
+            #         print("教师模型开始计算")
+            #         pretrain_pred = teacher_transformer(**model_kwargs)
+            #         pretrain_pred = pretrain_pred[0]
             
-            print("pretrain_pred mean/std:",pretrain_pred.mean().item(), pretrain_pred.std().item() )
-            dxt_dt = sigma_data * pretrain_pred
+            # dxt_dt = sigma_data * pretrain_pred
+            dxt_dt = torch.cos(t)*z - torch.sin(t)*model_input
+            print(f"dxt_dt:{dxt_dt.mean()}")
+            print(f"dxt_dt_l2:{dxt_dt.norm().item()}")
+
             v_x = torch.cos(t) * torch.sin(t) * dxt_dt / sigma_data
             v_t = torch.cos(t) * torch.sin(t)
             
-            scaled_input = x_t / sigma_data
-            print("Scaled input mean/std:", scaled_input.mean().item(), scaled_input.std().item())
-            v_x_norm = v_x.norm().item()
-            v_t_norm = v_t.norm().item()
-            print("Tangent vectors norm:", v_x_norm, v_t_norm)
+
                 
             print("雅可比矩阵开始计算")  
+
+
+
             with torch.no_grad():
                 F_theta, F_theta_grad = torch.func.jvp(
                                 model_wrapper, (x_t / sigma_data, t), (v_x, v_t), has_aux=False
@@ -252,8 +252,6 @@ def distill_one_step(
                 
                 print(f"F_theta_grad{F_theta_grad[0].shape}")
                 print(f"F_theta{F_theta[0].shape}")
-                
-            
             
             print("学生模型开始计算")
             F_theta, logvar = transformer(
@@ -267,6 +265,7 @@ def distill_one_step(
             
             # Clone F_theta to avoid modifying the view
             
+            # logvar = torch.randn(1).cuda()
             logvar = logvar.view(-1, 1, 1, 1, 1)
             F_theta = F_theta[0]
             F_theta_grad = F_theta_grad[0] 
@@ -280,39 +279,12 @@ def distill_one_step(
             # Calculate gradient g using JVP rearrangement
             g = -torch.cos(t) * torch.cos(t) * (sigma_data * F_theta_minus - dxt_dt)
             second_term = -r * (torch.cos(t) * torch.sin(t) * x_t + sigma_data * F_theta_grad)
-
-        
-
-            
             # pdb.set_trace()
             print(g.shape)
             print(f"F_theta_grad{F_theta_grad.mean()}")
-            
-            # 计算 g 和 second_term 的数量级（需分离计算图，避免干扰梯度）
-            with torch.no_grad():
-                # 取绝对值后计算对数，向下取整得到数量级
-                g_mean = g.mean()
-                second_mean =  second_term.mean()
-                g_order = torch.floor(torch.log10(torch.abs(g_mean))).item()
-                second_term_order = torch.floor(torch.log10(torch.abs(second_mean))).item()
-
-                # 计算缩放因子（10 的幂次方）
-                scale_factor = 10 ** (g_order - second_term_order)
-                scale_factor = torch.tensor(scale_factor, dtype=g.dtype, device=g.device)
-                print("scale_factor:",scale_factor )
-            # 对 second_term 进行缩放（保留梯度）
-            second_term_scaled = second_term * scale_factor
-
             print(f"g:{g.mean()}")
             print(f"g_max:{g.max()}")
             print(f"second:{second_term.mean()}")
-            print(f"second—scaled_mean:{second_term_scaled.mean()}")
-            print(f"second—scaled_norm:{second_term_scaled.norm().item()}")
-            
-            
-            
-            
-            g = g+ second_term_scaled
             # g = g + second_term
 
             # Tangent normalization
@@ -331,8 +303,9 @@ def distill_one_step(
             g_norm_4 =  (norm_dim1 * norm_dim2 * norm_dim3 * norm_dim4).pow(1/4)
             swanlab.log({"Debug/g":g.mean(),"Debug/g_max":g.max(),"Debug/g_norm":g_norm.mean(),"Debug/g_norm_4":g_norm_4.mean()})
 
-            g = g / (g_norm + 0.1)  # 0.1 is the constant cs
+            g = g / (g_norm + 0.1)  # 0.1 is the constant c
             # g =  g / (g_norm_4 + 0.1) 
+            # g = g = g / (1 + 0.1)
             print(f"g_after:{g.mean()}")
 
             
@@ -343,7 +316,6 @@ def distill_one_step(
             
             # Calculate loss with normalization factor
             loss = (weight / torch.exp(logvar)) * l2_loss + logvar
-            # loss = l2_loss 
             # pdb.set_trace()
             loss = loss.mean() 
             
@@ -362,22 +334,11 @@ def distill_one_step(
         dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
         total_loss += avg_loss.item()
 
-    def compute_grad_norm(parameters):
-        # 获取所有梯度的范数（L2 norm）
-        grads = [p.grad for p in parameters if p.grad is not None]
-        total_norm = torch.norm(torch.stack([torch.norm(g.detach(), 2) for g in grads]), 2)
-        return total_norm # 返回标量值
 
    
-    # grad_norm = compute_grad_norm(transformer.parameters())
     grad_norm = clip_grad.clip_grad_norm_(transformer.parameters(), max_grad_norm)    
-    swanlab.log({"Debug/grad_after":grad_norm.mean() / g_norm_4.mean() })
     params_before = {name: param.data.clone() for name, param in transformer.named_parameters() if param.requires_grad}
     optimizer.step()
-    
-    # for name, param in transformer.named_parameters():
-    #     writer.add_histogram(f'weights/{name}', param, global_step)
-    #     writer.add_histogram(f'grads/{name}', param.grad,  global_step)
     # 计算并记录参数更新的幅度
     with torch.no_grad():
         param_changes = {}
@@ -401,8 +362,6 @@ def distill_one_step(
                   f'Avg update ratio: {avg_update_ratio:.6f}, '
                   f'Total update norm: {total_update_norm:.6f}')})
     lr_scheduler.step()
-    
-
 
     return total_loss, grad_norm.item(), model_pred_norm,loss_no_weight,loss_no_logvar
 
@@ -588,7 +547,7 @@ def main(args):
         desc="Steps",
         disable=rank > 0,
     )
-    global_step = init_steps+1
+    global_step = init_steps
 
     # loader = sp_parallel_dataloader_wrapper(train_dataloader, args.sp_size)
     loader = sp_parallel_dataloader_wrapper(
@@ -598,9 +557,6 @@ def main(args):
         args.sp_size,
         args.train_sp_batch_size,
     )
-    
-    writer = SummaryWriter(log_dir="./logs")
-
 
     for epoch in range(args.num_train_epochs):
         train_loss = 0.0
@@ -630,7 +586,6 @@ def main(args):
                     hunyuan_teacher_disable_cfg=args.hunyuan_teacher_disable_cfg,
                     global_step=global_step,
                     text_encoder = text_encoder,
-                    writer = writer,
 
                 )
                 # Increment global_step after each distill step
@@ -654,8 +609,7 @@ def main(args):
             if rank <= 0:
                 swanlab.log(logs)
 
-            # if global_step % args.checkpointing_steps == 0:
-            if global_step in [2,5,100,300,500,1000,2000,3000,4000,5000]:
+            if global_step % args.checkpointing_steps == 0:
                 if rank <= 0:
                     if args.use_lora:
                         main_print(f"  save lora checkpoint in step：{global_step}")
@@ -672,6 +626,7 @@ def main(args):
                             rank,
                             args.output_dir,
                             step=global_step,
+                            use_fsdp = False
                         )
                         
 
@@ -692,6 +647,7 @@ def main(args):
                 rank,
                 args.output_dir,
                 args.max_train_steps,
+                Flase
             )
 
     if get_sequence_parallel_state():
@@ -732,6 +688,8 @@ if __name__ == "__main__":
     parser.add_argument("--logvar",type=bool, default=True, help="Whether to use log variance in sCM.")
     parser.add_argument('--class_dropout_prob', type=float, default=0.0,
                    help='Probability of class dropout during training')
+    parser.add_argument('--cfg_scale', type=float, default=5.0,
+                    help='Configuration scale factor')
     parser.add_argument('--cfg_embed', type=bool, default=True,
                     help='Whether to use configuration embedding')
     parser.add_argument('--cfg_embed_scale', type=float, default=0.1,
@@ -773,7 +731,7 @@ if __name__ == "__main__":
     
     
     # dataset & dataloader
-    parser.add_argument("--data_json_path", type=str , default= "/run/determined/workdir/data/H800/datasets/webvid-10k/Image-Vid-wan/videos2captionclip.json")
+    parser.add_argument("--data_json_path", type=str , default= "/run/determined/workdir/data/H800/datasets/webvid-10k/Image-Vid-wan/videos2caption.json")
     parser.add_argument("--num_height", type=int, default=480)
     parser.add_argument("--num_width", type=int, default=832)
     parser.add_argument("--num_frames", type=int, default=81)
@@ -786,10 +744,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--train_batch_size",
         type=int,
-        default=16,
+        default=4,
         help="Batch size (per device) for the training dataloader.",
     )
-    parser.add_argument("--num_latent_t", type=int, default=2, help="Number of latent timesteps.")
+    parser.add_argument("--num_latent_t", type=int, default=32, help="Number of latent timesteps.")
     parser.add_argument("--group_frame", action="store_true")  # TODO
     parser.add_argument("--group_resolution", action="store_true")  # TODO
 
@@ -813,7 +771,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/run/determined/workdir/data/H800/datasets/webvid-10k/outputs/1e5-latent2-rejvp-cfg5-norm",
+        default="/run/determined/workdir/data/H800/datasets/webvid-10k/outputs/1e8-16-norm-scm-train",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -858,7 +816,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_train_steps",
         type=int,
-        default=3000,
+        default=300,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
     )
     parser.add_argument(
@@ -870,7 +828,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-5,
+        default=1e-8,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
@@ -960,8 +918,9 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to apply the cfg_solver.",
     )
-    parser.add_argument("--distill_cfg", type=float, default=5.0, help="Distillation coefficient.")
+    parser.add_argument("--distill_cfg", type=float, default=3.0, help="Distillation coefficient.")
     # ["euler_linear_quadratic", "pcm", "pcm_linear_qudratic"]
+    parser.add_argument("--scheduler_type", type=str, default="pcm", help="The scheduler type to use.")
     parser.add_argument(
         "--linear_quadratic_threshold",
         type=float,

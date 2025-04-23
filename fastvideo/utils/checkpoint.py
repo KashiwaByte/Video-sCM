@@ -23,6 +23,15 @@ def save_checkpoint_optimizer(model, optimizer, rank, output_dir, step, discrimi
             FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
     ):
         cpu_state = model.state_dict()
+        # 确保新增层的参数被正确保存
+        if hasattr(model, 'logvar_linear') and model.logvar_linear is not None:
+            cpu_state['logvar_linear.weight'] = model.logvar_linear.weight
+            cpu_state['logvar_linear.bias'] = model.logvar_linear.bias
+        if hasattr(model, 't_embedder') and model.t_embedder is not None:
+            cpu_state['t_embedder.mlp.0.weight'] = model.t_embedder.mlp[0].weight
+            cpu_state['t_embedder.mlp.0.bias'] = model.t_embedder.mlp[0].bias
+            cpu_state['t_embedder.mlp.2.weight'] = model.t_embedder.mlp[2].weight
+            cpu_state['t_embedder.mlp.2.bias'] = model.t_embedder.mlp[2].bias
         optim_state = FSDP.optim_state_dict(
             model,
             optimizer,
@@ -51,14 +60,36 @@ def save_checkpoint_optimizer(model, optimizer, rank, output_dir, step, discrimi
     main_print(f"--> checkpoint saved at step {step}")
 
 
-def save_checkpoint(transformer, rank, output_dir, step):
+def save_checkpoint(transformer, rank, output_dir, step, use_fsdp=True):
     main_print(f"--> saving checkpoint at step {step}")
-    with FSDP.state_dict_type(
-            transformer,
-            StateDictType.FULL_STATE_DICT,
-            FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
-    ):
+    if use_fsdp:
+        with FSDP.state_dict_type(
+                transformer,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+                FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        ):
+            cpu_state = transformer.state_dict()
+            # 确保新增层的参数被正确保存
+            if hasattr(transformer, 'logvar_linear') and transformer.logvar_linear is not None:
+                cpu_state['logvar_linear.weight'] = transformer.logvar_linear.weight
+                cpu_state['logvar_linear.bias'] = transformer.logvar_linear.bias
+            if hasattr(transformer, 't_embedder') and transformer.t_embedder is not None:
+                cpu_state['t_embedder.mlp.0.weight'] = transformer.t_embedder.mlp[0].weight
+                cpu_state['t_embedder.mlp.0.bias'] = transformer.t_embedder.mlp[0].bias
+                cpu_state['t_embedder.mlp.2.weight'] = transformer.t_embedder.mlp[2].weight
+                cpu_state['t_embedder.mlp.2.bias'] = transformer.t_embedder.mlp[2].bias
+    else:
         cpu_state = transformer.state_dict()
+        # 确保新增层的参数被正确保存
+        if hasattr(transformer, 'logvar_linear') and transformer.logvar_linear is not None:
+            cpu_state['logvar_linear.weight'] = transformer.logvar_linear.weight
+            cpu_state['logvar_linear.bias'] = transformer.logvar_linear.bias
+        if hasattr(transformer, 't_embedder') and transformer.t_embedder is not None:
+            cpu_state['t_embedder.mlp.0.weight'] = transformer.t_embedder.mlp[0].weight
+            cpu_state['t_embedder.mlp.0.bias'] = transformer.t_embedder.mlp[0].bias
+            cpu_state['t_embedder.mlp.2.weight'] = transformer.t_embedder.mlp[2].weight
+            cpu_state['t_embedder.mlp.2.bias'] = transformer.t_embedder.mlp[2].bias
     # todo move to get_state_dict
     if rank <= 0:
         save_dir = os.path.join(output_dir, f"checkpoint-{step}")
@@ -234,6 +265,7 @@ def save_lora_checkpoint(transformer, optimizer, rank, output_dir, step, pipelin
             transformer,
             StateDictType.FULL_STATE_DICT,
             FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+            FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
     ):
         full_state_dict = transformer.state_dict()
         lora_optim_state = FSDP.optim_state_dict(

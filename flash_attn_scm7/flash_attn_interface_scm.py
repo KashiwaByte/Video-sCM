@@ -168,7 +168,7 @@ def _flash_attn_varlen_forward(
     zero_tensors: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state  = flash_attn_gpu.varlen_fwd(
+    out, softmax_lse, S_dmask, rng_state,_,_,_,_  = flash_attn_gpu.varlen_fwd(
         q,
         k,
         v,

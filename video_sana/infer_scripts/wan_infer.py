@@ -83,26 +83,6 @@ def _parse_args():
     )
     
     
-    # use_scm
-    parser.add_argument(
-        "--use_scm",
-        type=bool,
-        default=False,
-        help="Whether to use scm.")
-    
-    parser.add_argument(
-        "--sigma_data",
-        type=float,
-        default=0.5,
-        help="The sigma_data to use for generating the image or video.")
-    
-    
-    parser.add_argument(
-        "--intermediate_timesteps",
-        type=int,
-        default=None,
-        help="The intermediate_timesteps to use for generating the image or video.")
-    
 
     parser.add_argument(
         "--task",
@@ -342,8 +322,9 @@ def generate(args):
 
        
        
-        logging.info("Creating WanT2V_SCM pipeline.")
-        wan_t2v = WanT2V_SCM(
+
+        logging.info("Creating WanT2V pipeline.")
+        wan_t2v = WanT2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
             wanmodel_dir= args.wanmodel_dir,
@@ -353,9 +334,7 @@ def generate(args):
             dit_fsdp=args.dit_fsdp,
             use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
             t5_cpu=args.t5_cpu,
-            use_scm= args.use_scm,
         )
-
 
         logging.info(
             f"Generating {'image' if 't2i' in args.task else 'video'} ...")
@@ -368,9 +347,7 @@ def generate(args):
             sampling_steps=args.sample_steps,
             guide_scale=args.sample_guide_scale,
             seed=args.base_seed,
-            offload_model=args.offload_model,
-            sigma_data=args.sigma_data,
-            intermediate_timesteps= args.intermediate_timesteps)
+            offload_model=args.offload_model)
         print(video)
         
 

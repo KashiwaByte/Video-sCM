@@ -11,8 +11,8 @@ print(current_file_path)
 sys.path.append(current_file_path)
 
 
-from video_sana.models.modules.ladd_blocks import DiscHead
-from video_sana.models.wan.wan_scm import WanModelSCM
+from video_sana.models.scm_model.modules.ladd_blocks import DiscHead
+from video_sana.models.scm_model.wan_scm import WanModelSCM
 
 class WanModelSCMDiscriminator(nn.Module):
     def __init__(self, pretrained_model: WanModelSCM, is_multiscale=False, head_block_ids=None):
@@ -27,7 +27,7 @@ class WanModelSCMDiscriminator(nn.Module):
 
         heads = []
         for i in range(len(self.block_hooks)):
-            heads.append(DiscHead(self.transformer.hidden_size, 0, 0))
+            heads.append(DiscHead(self.transformer.dim, 0, 0))
         self.heads = nn.ModuleList(heads)
 
     def get_head_inputs(self):

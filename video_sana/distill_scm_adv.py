@@ -8,9 +8,15 @@ import time
 from collections import deque
 from copy import deepcopy
 import torch.nn.utils.clip_grad as clip_grad
+from torch.func import jacrev, jvp
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
+import torch.nn as nn
+
+import faulthandler
+faulthandler.enable()
 import swanlab
 from accelerate.utils import set_seed
 from diffusers.optimization import get_scheduler
@@ -34,6 +40,9 @@ parent_dir = os.path.dirname(current_dir)
 # 将祖父目录添加到 sys.path 中
 sys.path.append(parent_dir)
 
+print(parent_dir)
+
+
 from fastvideo.dataset.latent_datasets import (LatentDataset, latent_collate_function)
 from fastvideo.models.mochi_hf.mochi_latents_utils import normalize_dit_input
 from fastvideo.utils.checkpoint import (resume_lora_optimizer, save_checkpoint, save_lora_checkpoint)
@@ -47,6 +56,12 @@ from fastvideo.utils.validation import log_validation
 
 from diffusion import SCMScheduler
 from diffusion.model.respace import compute_density_for_timestep_sampling
+# from diffusion.utils.checkpoint import load_checkpoint_scm, save_checkpoint_scm
+
+from models.wan.modules.t5 import T5EncoderModel
+from models.scm_model.modules.ladd_wan import WanModelSCMDiscriminator,DiscHeadModel
+
+from torch.utils.tensorboard import SummaryWriter
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.31.0")
@@ -79,11 +94,12 @@ def get_norm(model_pred, norms, gradient_accumulation_steps):
     norms["absolute max"] += absolute_max.item()
 
 
-def distill_one_step(
+def distill(
     transformer,
     model_type,
     teacher_transformer,
-    optimizer,
+    optimizer_G,
+    optimizer_D,
     lr_scheduler,
     loader,
     noise_scheduler,
@@ -95,156 +111,561 @@ def distill_one_step(
     not_apply_cfg_solver,
     distill_cfg,
     hunyuan_teacher_disable_cfg,
+    global_step,
+    text_encoder,
+    writer,
+    num_train_epochs,
+    num_update_steps_per_epoch,
+    disc,
+    init_steps=0,
+    progress_bar=None,
 ):
-    total_loss = 0.0
-    optimizer.zero_grad()
-    model_pred_norm = {
-        "fro": 0.0,  # codespell:ignore
-        "largest singular value": 0.0,
-        "absolute mean": 0.0,
-        "absolute max": 0.0,
-    }
-    for _ in range(gradient_accumulation_steps):
-        (
-            latents,
-            encoder_hidden_states,
-            latents_attention_mask,
-            encoder_attention_mask,
-        ) = next(loader)
-        sigma_data=args.sigma_data
-        model_input = normalize_dit_input(model_type, latents)
-        noise = torch.randn_like(model_input)*sigma_data
-        bsz = model_input.shape[0]
-        
-        # Sample timesteps for SCM training
-        if args.weighting_scheme == "logit_normal_trigflow":
-            u = compute_density_for_timestep_sampling(
-                weighting_scheme=args.weighting_scheme,
-                batch_size=bsz,
-                logit_mean=args.logit_mean,
-                logit_std=args.logit_std,
-                mode_scale=None,
-            )
-            timesteps = u.float().to(model_input.device)
-        elif args.weighting_scheme == "logit_normal_trigflow_ladd":
-            indices = torch.randint(0, len(args.add_noise_timesteps), (bsz,))
-            u = torch.tensor([args.add_noise_timesteps[i] for i in indices])
-            if len(args.add_noise_timesteps) == 1:
-                # zero-SNR
-                timesteps = torch.tensor([1.57080 for i in indices]).float().to(model_input.device)
-            else:
-                timesteps = u.float().to(model_input.device)
-        else:
-            # Default random sampling
-            timesteps = torch.rand(bsz, device=model_input.device) * 1.57080  # pi/2
+    rank = int(os.environ["RANK"])
+    phase = "G"
+    sigma_data=args.sigma_data
+    g_step = 0
+    d_step = 0
+    # Now you train the model
+
+    for epoch in range(num_train_epochs):
+        for step in range(num_update_steps_per_epoch):
+            # Skip steps for resuming
+            if global_step < init_steps:
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                global_step += 1
+                continue
                 
-        t = timesteps.view(-1, 1, 1, 1)
-        
-        # Add noise according to SCM
-        z = torch.randn_like(model_input) * sigma_data
-        x_t = torch.cos(t) * model_input + torch.sin(t) * z
-        
-        
-        def model_wrapper(scaled_x_t, t):
-            pred, logvar = transformer(
-                x=scaled_x_t, context=encoder_hidden_states, t=t.flatten(), seq_len=seq_len, return_logvar=True, jvp=True
-            )
-            return pred, logvar
-        
-        target_shape = (16, 21, 60, 104)
-        patch_size = (1, 2, 2)
-        seq_len = math.ceil((target_shape[2] * target_shape[3]) /
-                          (patch_size[1] * patch_size[2]) *
-                          target_shape[1] / sp_size) * sp_size
-        
-        # Predict using transformer
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            model_kwargs = {
-                "x": x_t / sigma_data,
-                "context": encoder_hidden_states,
-                "t": t.flatten(),
-                "seq_len": seq_len,
-                "return_logvar": True,
-                "jvp": True
-            }
-            
-            # Calculate v_x and v_t for jvp
-            pretrain_pred = teacher_transformer(**model_kwargs)[0]
-            dxt_dt = sigma_data * pretrain_pred
-            v_x = torch.cos(t) * torch.sin(t) * dxt_dt / sigma_data
-            v_t = torch.cos(t) * torch.sin(t)
-            
-            # Calculate F_theta using jvp
-            F_theta, F_theta_grad, logvar = torch.func.jvp(
-                            model_wrapper, (x_t / sigma_data, t), (v_x, v_t), has_aux=True
+            total_loss = 0.0         
+            model_pred_norm = {
+                "fro": 0.0,  # codespell:ignore
+                "largest singular value": 0.0,
+                "absolute mean": 0.0,
+                "absolute max": 0.0,
+            }   
+
+            for _ in range(gradient_accumulation_steps):
+                (
+                    latents,
+                    encoder_hidden_states,
+                    latents_attention_mask,
+                    encoder_attention_mask,
+                ) = next(loader)
+                model_input= normalize_dit_input(model_type, latents)
+                x0 = model_input * sigma_data
+                bs = x0.shape[0]
+                
+                def get_timesteps(
+                    weighting_scheme=args.weighting_scheme,
+                    logit_mean=args.logit_mean,
+                    logit_std=args.logit_std,
+                ):
+                    # Sample timesteps for SCM training
+                    if weighting_scheme == "logit_normal_trigflow":
+                        u = compute_density_for_timestep_sampling(
+                            weighting_scheme=weighting_scheme,
+                            batch_size=bs,
+                            logit_mean=logit_mean,
+                            logit_std=logit_std,
+                            mode_scale=None,
                         )
-            
-            F_theta, logvar = transformer(
-                x=x_t / sigma_data,
-                context=encoder_hidden_states,
-                t=t.flatten(),
-                seq_len=seq_len,
-                return_logvar=True,
-                jvp=False
-            )
-            
-            logvar = logvar.view(-1, 1, 1, 1)
-            F_theta_grad = F_theta_grad.detach()
-            F_theta_minus = F_theta.detach()
-            
-            # Calculate gradient g using JVP rearrangement
-            g = -torch.cos(t) * torch.cos(t) * (sigma_data * F_theta_minus - dxt_dt)
-            
-            # Warmup steps
-            r = min(1, global_step / args.tangent_warmup_steps)
-            second_term = -r * (torch.cos(t) * torch.sin(t) * x_t + sigma_data * F_theta_grad)
-            g = g + second_term
-            
-            # Tangent normalization
-            g_norm = torch.linalg.vector_norm(g, dim=(1, 2, 3), keepdim=True)
-            g = g / (g_norm + 0.1)  # 0.1 is the constant c
-            
-            # Calculate loss with weight and logvar
-            sigma = torch.tan(t) * sigma_data
-            weight = 1 / sigma
-            l2_loss = torch.square(F_theta - F_theta_minus - g)
-            
-            # Calculate loss with normalization factor
-            loss = (weight / torch.exp(logvar)) * l2_loss + logvar
-            loss = loss.mean() / gradient_accumulation_steps
+                        timesteps = u.float().to(x0.device)
+                        denoise_timesteps = None
+                    elif weighting_scheme == "logit_normal_trigflow_ladd":
+                        indices = torch.randint(0, len(args.add_noise_timesteps), (bs,))
+                        u = torch.tensor([args.add_noise_timesteps[i] for i in indices])
+                        timesteps = u.float().to(x0.device)
+                        if len(args.add_noise_timesteps) == 1:
+                            # zero-SNR
+                            denoise_timesteps = torch.tensor([1.57080 for i in indices]).float().to(x0.device)
+                        else:
+                            denoise_timesteps = u.float().to(x0.device)
+                    else:
+                        # Default random sampling
+                        timesteps = torch.rand(bs, device=x0.device) * 1.57080  # pi/2
+                    return timesteps, denoise_timesteps
+                
+                
+                timesteps, denoise_timesteps = get_timesteps(
+                    weighting_scheme=args.weighting_scheme,
+                    logit_mean=args.logit_mean,
+                    logit_std=args.logit_std,
+                )
+                        
+                t = timesteps.view(-1, 1, 1, 1, 1)
+                t_G = denoise_timesteps.view(-1, 1, 1, 1, 1) if denoise_timesteps is not None else t
             
             
-            loss_no_logvar = weight * torch.square(F_theta - F_theta_minus - g)
-            loss_no_logvar = loss_no_logvar.mean()
-            loss_no_weight = l2_loss.mean()
-            g_norm = g_norm.mean()
-            
-        
-        pred_x_0 = torch.cos(t_G) * x_t - torch.sin(t_G) * F_theta * sigma_data
+                # Add noise according to SCM
+                z = torch.randn_like(x0) * sigma_data
+                x_t = torch.cos(t) * x0 + torch.sin(t) * z
+                # pdb.set_trace()
+                
+                def model_wrapper(scaled_x_t, t):
+                    # Get unwrapped model to avoid FSDP issues with jvp
+                    # unwrapped_transformer = transformer._fsdp_wrapped_module if hasattr(transformer, '_fsdp_wrapped_module') else transformer
+                    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    # unwrapped_transformer = unwrapped_transformer.to(device)    
+                    # pred = unwrapped_transformer(
+                    #     x=scaled_x_t, context=encoder_hidden_states, t=t.flatten(), seq_len=seq_len, return_logvar=False, jvp=True
+                    # )
+                    
+                    pred = transformer(
+                        x=scaled_x_t, context=encoder_hidden_states, t=t.flatten(), seq_len=seq_len, return_logvar=False, jvp=True
+                    )
+                
+                    if isinstance(pred, list):
+                        pred = tuple(pred)
+                    return pred
 
-        # Calculate model prediction norms
-        get_norm(F_theta.detach().float(), model_pred_norm, gradient_accumulation_steps)
-        loss.backward()
-        
-        avg_loss = loss.detach().clone()
-        dist.all_reduce(avg_loss, op=dist.ReduceOp.AVG)
-        total_loss += avg_loss.item()
+                if g_step % args.gradient_accumulation_steps == 0:
+                    optimizer_G.zero_grad()
+
+                if phase == "G":
+                    disc.eval()
+                    transformer.train()
+                    
+                    target_shape = (16, 21, 60, 104)
+                    patch_size = (1, 2, 2)
+                    seq_len = math.ceil((target_shape[2] * target_shape[3]) /
+                                    (patch_size[1] * patch_size[2]) *
+                                    target_shape[1] / sp_size) * sp_size
+                    
+                    # Predict using transformer
+                    # pdb.set_trace()
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        model_kwargs = {
+                            "x": x_t / sigma_data,
+                            "context": encoder_hidden_states,
+                            "t": t.flatten(),
+                            "seq_len": seq_len,
+                            "return_logvar": False,
+                            "jvp": False
+                        }
 
 
-   
-    if phase == "G":
-        grad_norm = clip_grad.clip_grad_norm_(transformer.parameters(), max_grad_norm)
-        optimizer_G.step()
-        lr_scheduler.step()
-    else:
-        grad_norm = clip_grad.clip_grad_norm_(disc.parameters(), max_grad_norm)
-        optimizer_D.step()
+                        if args.scm_cfg_scale[0] > 1 and args.cfg_embed:    
+                            # 创建无条件文本嵌入
+                            # uncond_context = torch.zeros_like(encoder_hidden_states)  # 方法1:全零初始化
+                            # 或者使用预训练模型的空字符串嵌入
+                            n_prompt = args.sample_neg_prompt
+                            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    return total_loss, grad_norm.item(), model_pred_norm
+                            context_null = text_encoder([n_prompt],device)
+                            context_null = [t.to(device) for t in context_null]     
+            
+                            
+                            uncond_cfg_model_kwargs = {
+                                "x": x_t / sigma_data,
+                                "context": context_null, 
+                                "t": t.flatten(),
+                                "seq_len": seq_len,
+                                "return_logvar": False,
+                                "jvp": False
+                            }
+                            
+                            with torch.no_grad():
+                                print("教师模型CFG预测开始")
+                                pretrain_pred_cond = teacher_transformer(**model_kwargs)[0]
+                                pretrain_pred_uncond = teacher_transformer(**uncond_cfg_model_kwargs)[0]
+                                # pdb.set_trace()
+
+                                # 应用CFG
+                                pretrain_pred =  pretrain_pred_uncond  + distill_cfg * (pretrain_pred_cond - pretrain_pred_uncond)
+                        else:
+                            with torch.no_grad():
+                                print("教师模型开始计算")
+                                pretrain_pred = teacher_transformer(**model_kwargs)
+                                pretrain_pred = pretrain_pred[0]
+                        
+                        print("pretrain_pred mean/std:",pretrain_pred.mean().item(), pretrain_pred.std().item() )
+                        dxt_dt = sigma_data * pretrain_pred
+                        v_x = torch.cos(t) * torch.sin(t) * dxt_dt / sigma_data
+                        v_t = torch.cos(t) * torch.sin(t)
+                        
+                        scaled_input = x_t / sigma_data
+                        print("Scaled input mean/std:", scaled_input.mean().item(), scaled_input.std().item())
+                        v_x_norm = v_x.norm().item()
+                        v_t_norm = v_t.norm().item()
+                        print("Tangent vectors norm:", v_x_norm, v_t_norm)
+                            
+                        print("雅可比矩阵开始计算")  
+                        with torch.no_grad():
+                            F_theta, F_theta_grad = torch.func.jvp(
+                                            model_wrapper, (x_t / sigma_data, t), (v_x, v_t), has_aux=False
+                                        )
+                            
+                            print(f"F_theta_grad{F_theta_grad[0].shape}")
+                            print(f"F_theta{F_theta[0].shape}")
+                            
+                        
+                        print("学生模型开始计算")
+                        F_theta, logvar = transformer(
+                            x=x_t / sigma_data,
+                            context=encoder_hidden_states,
+                            t=t.flatten(),
+                            seq_len=seq_len,
+                            return_logvar=True,
+                            jvp=False
+                        )
+                        
+                        # Clone F_theta to avoid modifying the view
+                        
+                        logvar = logvar.view(-1, 1, 1, 1, 1)
+                        F_theta = F_theta[0]
+                        F_theta_grad = F_theta_grad[0] 
+                        F_theta_grad = F_theta_grad.detach()
+                        F_theta_minus = F_theta.detach()
+                        
+                        
+                        # Warmup steps
+                        r = min(1, global_step / args.tangent_warmup_steps)
+                        
+                        # Calculate gradient g using JVP rearrangement
+                        g = -torch.cos(t) * torch.cos(t) * (sigma_data * F_theta_minus - dxt_dt)
+                        second_term = -r * (torch.cos(t) * torch.sin(t) * x_t + sigma_data * F_theta_grad)
+
+                    
+
+                        
+                        # pdb.set_trace()
+                        print(g.shape)
+                        print(f"F_theta_grad{F_theta_grad.mean()}")
+                        
+                        # 计算 g 和 second_term 的数量级（需分离计算图，避免干扰梯度）
+                        with torch.no_grad():
+                            # 取绝对值后计算对数，向下取整得到数量级
+                            g_mean = g.mean()
+                            second_mean =  second_term.mean()
+                            g_order = torch.floor(torch.log10(torch.abs(g_mean))).item()
+                            second_term_order = torch.floor(torch.log10(torch.abs(second_mean))).item()
+
+                            # 计算缩放因子（10 的幂次方）
+                            scale_factor = 10 ** (g_order - second_term_order)
+                            scale_factor = torch.tensor(scale_factor, dtype=g.dtype, device=g.device)
+                            print("scale_factor:",scale_factor )
+                        # 对 second_term 进行缩放（保留梯度）
+                        second_term_scaled = second_term * scale_factor
+
+                        print(f"g:{g.mean()}")
+                        print(f"g_max:{g.max()}")
+                        print(f"second:{second_term.mean()}")
+                        print(f"second—scaled_mean:{second_term_scaled.mean()}")
+                        print(f"second—scaled_norm:{second_term_scaled.norm().item()}")
+                        
+                        
+                        
+                        
+                        g = g+ second_term_scaled
+                        # g = g + second_term
+
+                        # Tangent normalization
+                        g_norm = torch.linalg.vector_norm(g, dim=(1, 2, 3, 4), keepdim=True)
+                        print(f"g_norm:{g_norm.mean()}")
+                        print(f"g在维度1的范数: {torch.linalg.vector_norm(g, dim=1).mean()}")
+                        print(f"g在维度2的范数: {torch.linalg.vector_norm(g, dim=2).mean()}")
+                        print(f"g在维度3的范数: {torch.linalg.vector_norm(g, dim=3).mean()}")
+                        print(f"g在维度4的范数: {torch.linalg.vector_norm(g, dim=4).mean()}")
+
+                        norm_dim1 = torch.linalg.vector_norm(g, dim=1, keepdim=True)  # 形状 (N, 1, H, W, D)
+                        norm_dim2 = torch.linalg.vector_norm(g, dim=2, keepdim=True)  # 形状 (N, C, 1, W, D)
+                        norm_dim3 = torch.linalg.vector_norm(g, dim=3, keepdim=True)  # 形状 (N, C, H, 1, D)
+                        norm_dim4 = torch.linalg.vector_norm(g, dim=4, keepdim=True)  # 形状 (N, C, H, W, 1)
+                                    
+                        g_norm_4 =  (norm_dim1 * norm_dim2 * norm_dim3 * norm_dim4).pow(1/4)
+                        swanlab.log({"Debug/g":g.mean(),"Debug/g_max":g.max(),"Debug/g_norm":g_norm.mean(),"Debug/g_norm_4":g_norm_4.mean()})
+
+                        g = g / (g_norm + 0.1)  # 0.1 is the constant cs
+                        # g =  g / (g_norm_4 + 0.1) 
+                        print(f"g_after:{g.mean()}")
+
+                        
+                        # Calculate loss with weight and logvar
+                        sigma = torch.tan(t) * sigma_data
+                        weight = 1 / sigma
+                        l2_loss = torch.square(F_theta - F_theta_minus - g)
+                        
+                        # Calculate loss with normalization factor
+                        loss = (weight / torch.exp(logvar)) * l2_loss + logvar
+                        loss = loss.mean()
+
+                        loss_no_logvar = weight * torch.square(F_theta - F_theta_minus - g)
+                        loss_no_logvar = loss_no_logvar.mean()
+                        loss_no_weight = l2_loss.mean()
+                        g_norm = g_norm.mean()
+                    
+                    pred_x_0 = torch.cos(t_G) * x_t - torch.sin(t_G) * F_theta * sigma_data
+
+                    # Sample timesteps for discriminator
+                    timesteps_D,_ = get_timesteps(
+                        weighting_scheme=args.weighting_scheme_discriminator,
+                        logit_mean=args.logit_mean_discriminator,
+                        logit_std=args.logit_std_discriminator,
+                    )
+                    
+                    t_D = timesteps_D.view(-1, 1, 1, 1, 1)
+
+                    # Add noise to predicted x0
+                    z_D = torch.randn_like(x0) * sigma_data
+                    noised_predicted_x0 = torch.cos(t_D) * pred_x_0 + torch.sin(t_D) * z_D
+
+                    # Calculate adversarial loss
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        pred_fake = disc(x = noised_predicted_x0 / sigma_data, context = encoder_hidden_states, t = t_D.flatten(), seq_len = seq_len )
+                    if args.discriminator_loss == "cross entropy":
+                        adv_loss = F.binary_cross_entropy_with_logits(pred_fake, torch.ones_like(pred_fake))
+                    elif args.discriminator_loss == "hinge":
+                        adv_loss = -torch.mean(pred_fake)
+                    else:
+                        raise ValueError(f"Invalid adversarial loss type: {args.discriminator_loss}")
+                    
+                    
+                    if args.scm_loss:
+                        total_loss = args.scm_lambda * loss + adv_loss * args.adv_lambda  
+                    elif args.reconstruct_loss:
+                        total_loss = loss + adv_loss * args.train.adv_lambda
+                    else:
+                        total_loss = adv_loss 
+                        
+                    total_loss = total_loss / gradient_accumulation_steps
+                    
+                    get_norm(F_theta.detach().float(), model_pred_norm, gradient_accumulation_steps)
+                    total_loss.backward()
+                    g_step += 1
+                    
+                    if g_step % args.gradient_accumulation_steps == 0:
+                        # switch phase to D
+                        grad_norm = clip_grad.clip_grad_norm_(transformer.parameters(), max_grad_norm)    
+                        if torch.logical_or(grad_norm.isnan(), grad_norm.isinf()):
+                                optimizer_G.zero_grad(set_to_none=True)
+                                optimizer_D.zero_grad(set_to_none=True)
+                                logger.warning("NaN or Inf detected in grad_norm, skipping iteration...")
+                                continue
+                        phase = "D"
+                        
+                        optimizer_G.step()
+                        lr_scheduler.step()
+                        optimizer_G.zero_grad(set_to_none=True)
+
+                elif phase == 'D':
+                    disc.train()
+                    transformer.eval()
+                    
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        with torch.no_grad():
+                            F_theta = transformer(
+                                x=x_t / sigma_data,
+                                context=encoder_hidden_states,
+                                t=t_G.flatten(),
+                                seq_len=seq_len,
+                                return_logvar=False,
+                                jvp=False
+                            )
+                            F_theta = F_theta[0]
+                            pred_x_0 = torch.cos(t_G) * x_t - torch.sin(t_G) * F_theta * sigma_data
+                        
+                    # Sample timesteps for fake and real samples
+                    timestep_D_fake, _ = get_timesteps(
+                        weighting_scheme=args.weighting_scheme_discriminator,
+                        logit_mean=args.logit_mean_discriminator,
+                        logit_std=args.logit_std_discriminator,
+                    )
+                    if args.diff_timesteps_D:
+                        timesteps_D_real, _ = get_timesteps(
+                            weighting_scheme=args.weighting_scheme_discriminator,
+                            logit_mean=args.logit_mean_discriminator,
+                            logit_std=args.logit_std_discriminator,
+                        )
+                    else:
+                        timesteps_D_real = timestep_D_fake
+
+                    t_D_fake = timestep_D_fake.view(-1, 1, 1, 1, 1)
+                    t_D_real = timesteps_D_real.view(-1, 1, 1, 1, 1)    
+                    
+                    # Add noise to predicted x0 and real x0
+                    z_D_fake = torch.randn_like(x0) * sigma_data
+                    z_D_real = torch.randn_like(x0) * sigma_data
+                    noised_predicted_x0 = torch.cos(t_D_fake) * pred_x_0 + torch.sin(t_D_fake) * z_D_fake
+                    noised_latents = torch.cos(t_D_real) * x0 + torch.sin(t_D_real) * z_D_real
+
+                    
+                    # Add misaligned pairs if enabled and batch size > 1
+                    if args.misaligned_pairs_D and bs > 1:
+                        # Create shifted pairs
+                        shifted_x0 = torch.roll(x0, 1, 0)
+                        timesteps_D_shifted, _ = get_timesteps(
+                            weighting_scheme=args.weighting_scheme_discriminator,
+                            logit_mean=args.logit_mean_discriminator,
+                            logit_std=args.logit_std_discriminator,
+                        )
+                        t_D_shifted = timesteps_D_shifted.view(-1, 1, 1, 1, 1)
+
+                        # Add noise to shifted pairs
+                        z_D_shifted = torch.randn_like(shifted_x0) * sigma_data
+                        noised_shifted_x0 = torch.cos(t_D_shifted) * shifted_x0 + torch.sin(t_D_shifted) * z_D_shifted
+
+                        # Concatenate with original noised samples
+                        noised_predicted_x0 = torch.cat([noised_predicted_x0, noised_shifted_x0], dim=0)
+                        t_D_fake = torch.cat([t_D_fake, t_D_shifted], dim=0)
+                        context = torch.cat([encoder_hidden_states, encoder_hidden_states], dim=0)
+                        fake_kwargs = {**model_kwargs, "context": context}
+                    else:
+                        fake_kwargs = model_kwargs
+                        context = encoder_hidden_states
+                
+                    # Calculate D loss
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        pred_fake = disc(x = noised_predicted_x0 / sigma_data, t=t_D_fake.flatten(), context = context ,seq_len = seq_len )
+                        pred_true = disc(x = noised_latents / sigma_data, t = t_D_real.flatten(), context = encoder_hidden_states, seq_len = seq_len)
+
+                    # cross entropy loss
+                    if args.discriminator_loss == "cross entropy":
+                        loss_gen = F.binary_cross_entropy_with_logits(pred_fake, torch.zeros_like(pred_fake))
+                        loss_real = F.binary_cross_entropy_with_logits(pred_true, torch.ones_like(pred_true))
+                        loss_D = loss_gen + loss_real
+                    # hinge loss
+                    elif args.discriminator_loss == "hinge":
+                        loss_real = torch.mean(F.relu(1.0 - pred_true))
+                        loss_gen = torch.mean(F.relu(1.0 + pred_fake))
+                        loss_D = 0.5 * (loss_real + loss_gen)
+                    else:
+                        raise ValueError(f"Invalid discriminator loss type: {args.discriminator_loss}")
+
+                    def calculate_gradient_penalty(discriminator):
+                        from torch.utils.checkpoint import checkpoint
+
+                        head_inputs = discriminator.get_head_inputs()
+                        bs = head_inputs[0].shape[0]
+
+                        grad_penalty = 0.0
+
+                        for i, head_input in enumerate(head_inputs):
+                            head_input = torch.autograd.Variable(head_input, requires_grad=True)
+
+                            def forward_head(head_input):
+                                return discriminator.heads[i](head_input, None)
+
+                            discriminator_logits = checkpoint(forward_head, head_input, use_reentrant=False)
+
+                            gradients = torch.autograd.grad(
+                                outputs=discriminator_logits,
+                                inputs=head_input,
+                                grad_outputs=torch.ones(discriminator_logits.size()).to(head_input.device),
+                                create_graph=True,
+                                retain_graph=True,
+                            )[0]
+
+                            gradients = gradients.reshape(bs, -1)
+                            grad_penalty += gradients.norm(2, dim=1) ** 2
+
+                        grad_penalty = grad_penalty.mean() / len(head_inputs)
+
+                        return grad_penalty
+                    
+                    if args.r1_penalty:
+                        r1_penalty = calculate_gradient_penalty(
+                            disc,
+                        )
+                        loss_D = loss_D + args.r1_penalty_weight * r1_penalty
+
+                    loss_D = loss_D / args.gradient_accumulation_steps
+                    get_norm(F_theta.detach().float(), model_pred_norm, gradient_accumulation_steps)
+                    loss_D.backward()
+                    
+                    d_step += 1
+                    
+                    if d_step % args.gradient_accumulation_steps == 0:
+                        # switch phase to G
+                        grad_norm = clip_grad.clip_grad_norm_(transformer.parameters(), max_grad_norm)    
+                        if torch.logical_or(grad_norm.isnan(), grad_norm.isinf()):
+                                optimizer_G.zero_grad(set_to_none=True)
+                                optimizer_D.zero_grad(set_to_none=True)
+                                logger.warning("NaN or Inf detected in grad_norm, skipping iteration...")
+                                continue
+                        phase = "G"
+                        
+                        optimizer_D.step()
+                        optimizer_D.zero_grad(set_to_none=True)
+                
+                # updata log  information
+                if (phase == "G" and g_step % args.gradient_accumulation_steps == 0) or (
+                        phase == "D" and d_step % args.gradient_accumulation_steps == 0
+                    ):   
+                    lr = lr_scheduler.get_last_lr()[0]
+                    logs = {
+                        "lr": lr_scheduler.get_last_lr()[0],
+                        "step": global_step,            
+                    }
+                    logs.update(model_pred_norm)
+                    
+                    if rank <= 0:
+                        swanlab.log(logs)
+                        if args.scm_loss:
+                            swanlab.log({"train/loss_no_weight":loss_no_weight.item(),
+                                        "train/loss_no_logvar":loss_no_logvar.item(),
+                                        "train/grad_norm":grad_norm.mean().item(),
+                                        })
+                        if phase == "D":  # since we already change the phase to D, but the current step is still in G.
+                            swanlab.log({"G/total_loss":total_loss.mean().item(),
+                                        "G/adv_loss":adv_loss.mean().item(),})
+                        else:
+                            swanlab.log({"D/loss_D":loss_D.mean().item(),
+                                        "D/loss_gen":loss_gen.mean().item(),
+                                        "D/loss_real":loss_real.mean().item(),})
+                            if args.r1_penalty:
+                                swanlab.log({"D/r1_penalty":r1_penalty.mean().item()})  
+                    global_step += 1
+                    progress_bar.update(1)
+                    progress_bar.set_postfix(**logs)
+
+  
+
+                # if global_step % args.checkpointing_steps == 0:
+                if global_step in [2,5,100,300,500,1000,2000,3000,4000,5000]:
+                    if rank <= 0:
+                        if args.use_lora:
+                            main_print(f"  save lora checkpoint in step：{global_step}")
+                            save_lora_checkpoint(
+                                transformer,
+                                optimizer,
+                                args.output_dir,
+                                global_step,
+                            )
+                        else:
+                            main_print(f"  save checkpoint in step：{global_step}")
+                            save_checkpoint(
+                                transformer,
+                                rank,
+                                args.output_dir,
+                                step=global_step,
+                                use_fsdp = False
+                            )
+                                
+
+                # Save final checkpoint
+                if rank <= 0 and global_step == args.max_train_steps:
+                    if args.use_lora:
+                        main_print(f"  save final lora checkpoint in step：{args.max_train_steps}")
+                        save_lora_checkpoint(
+                            transformer,
+                            optimizer,
+                            args.output_dir,
+                            args.max_train_steps,
+                        )
+                    else:
+                        main_print(f"  save final checkpoint in step：{args.max_train_steps}")
+                        save_checkpoint(
+                            transformer,
+                            rank,
+                            args.output_dir,
+                            args.max_train_steps,
+                        )
 
 
 def main(args):
     torch.backends.cuda.matmul.allow_tf32 = True
+    # Initialize global_step as 1
+    global_step = 1
 
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
@@ -294,6 +715,8 @@ def main(args):
         args.use_cpu_offload,
         args.master_weight_type,
     )
+    
+    print(fsdp_kwargs)
 
     if args.use_lora:
         transformer.config.lora_rank = args.lora_rank
@@ -302,14 +725,26 @@ def main(args):
         transformer._no_split_modules = no_split_modules
         fsdp_kwargs["auto_wrap_policy"] = fsdp_kwargs["auto_wrap_policy"](transformer)
 
-    transformer = FSDP(
-        transformer,
-        **fsdp_kwargs,
-    )
-    teacher_transformer = FSDP(
-        teacher_transformer,
-        **fsdp_kwargs,
-    )
+    # transformer = FSDP(
+    #     transformer,
+    #     **fsdp_kwargs,
+    # )
+    
+    # teacher_transformer = FSDP(
+    #     teacher_transformer,
+    #     **fsdp_kwargs,
+    # )
+    
+    text_encoder = T5EncoderModel(
+                text_len=512,
+                dtype=torch.bfloat16,
+                device=torch.device('cuda'),
+                checkpoint_path='/run/determined/workdir/data/H800/diffusion/models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth',
+                tokenizer_path='/run/determined/workdir/data/H800/diffusion/models/Wan2.1-T2V-1.3B/google/umt5-xxl',
+                shard_fn=None)
+    
+    main_print("--> text-encoder loaded")
+
     
     transformer = transformer.cuda()
     teacher_transformer = teacher_transformer.cuda()
@@ -331,23 +766,41 @@ def main(args):
     params_to_optimize = transformer.parameters()
     params_to_optimize = list(filter(lambda p: p.requires_grad, params_to_optimize))
 
-    optimizer = torch.optim.AdamW(
+    # Initialize discriminator
+    disc = WanModelSCMDiscriminator(
+        pretrained_model=transformer,
+        is_multiscale=True,
+        head_block_ids={2, 8, 10, 12, 19}
+    ).to(device)
+
+    # Initialize optimizers
+    optimizer_G = torch.optim.AdamW(
         params_to_optimize,
-        lr=args.learning_rate,
+        lr=args.learning_rate, 
         betas=(0.9, 0.999),
         weight_decay=args.weight_decay,
-        eps=1e-8,
+        eps=1e-16,
+    )
+    
+    optimizer_D = torch.optim.AdamW(
+        disc.heads.parameters(),
+        lr=args.learning_rate,
+        betas=(0.9, 0.999), 
+        weight_decay=args.weight_decay,
+        eps=1e-16,
     )
 
     init_steps = 0
     if args.resume_from_lora_checkpoint:
         transformer, optimizer, init_steps = resume_lora_optimizer(transformer, args.resume_from_lora_checkpoint,
                                                                    optimizer)
-    main_print(f"optimizer: {optimizer}")
+    main_print(f"optimizer_G: {optimizer_G}")
+    main_print(f"optimizer_D: {optimizer_D}")
+
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
-        optimizer=optimizer,
+        optimizer=optimizer_G,
         num_warmup_steps=args.lr_warmup_steps * world_size,
         num_training_steps=args.max_train_steps * world_size,
         num_cycles=args.lr_num_cycles,
@@ -383,8 +836,8 @@ def main(args):
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     if rank <= 0:
-        project = args.tracker_project_name or "fastvideo"
-        swanlab.init(project='distill', config=args , mode='cloud',logdir="/storage/lintaoLab/lintao/botehuang")
+        project = args.tracker_project_name or "distill-scm-adv"
+        swanlab.init(project=project, config=args , mode='cloud',logdir="/home/tempuser11/botehuang/swanlab")
 
     total_batch_size = (world_size * args.gradient_accumulation_steps / args.sp_size * args.train_sp_batch_size)
     main_print("***** Running training *****")
@@ -407,72 +860,56 @@ def main(args):
         desc="Steps",
         disable=rank > 0,
     )
-    global_step = init_steps
 
-    loader = sp_parallel_dataloader_wrapper(train_dataloader, args.sp_size)
+    # loader = sp_parallel_dataloader_wrapper(train_dataloader, args.sp_size)
+    loader = sp_parallel_dataloader_wrapper(
+        train_dataloader,
+        device,
+        args.train_batch_size,
+        args.sp_size,
+        args.train_sp_batch_size,
+    )
+    
+    writer = SummaryWriter(log_dir="./logs")
 
-    for epoch in range(args.num_train_epochs):
-        train_loss = 0.0
-        for step in range(num_update_steps_per_epoch):
-            # Skip steps for resuming
-            if global_step < init_steps:
-                progress_bar.update(1)
-                global_step += 1
-                continue
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                loss, grad_norm, model_pred_norm = distill_one_step(
-                    transformer=transformer,
-                    model_type=args.model_type,
-                    teacher_transformer=teacher_transformer,
-                    optimizer=optimizer,
-                    lr_scheduler=lr_scheduler,
-                    loader=loader,
-                    noise_scheduler=noise_scheduler,
-                    gradient_accumulation_steps=args.gradient_accumulation_steps,
-                    sp_size=args.sp_size,
-                    max_grad_norm=args.max_grad_norm,
-                    uncond_prompt_embed=uncond_prompt_embed,
-                    uncond_prompt_mask=uncond_prompt_mask,
-                    not_apply_cfg_solver=args.not_apply_cfg_solver,
-                    distill_cfg=args.distill_cfg,
+    # Start Distill 
+    distill(
+            transformer=transformer,
+            model_type=args.model_type,
+            teacher_transformer=teacher_transformer,
+            optimizer_G=optimizer_G,
+            optimizer_D=optimizer_D,
+            lr_scheduler=lr_scheduler,
+            loader=loader,
+            noise_scheduler=noise_scheduler,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            sp_size=args.sp_size,
+            max_grad_norm=args.max_grad_norm,
+            uncond_prompt_embed=uncond_prompt_embed,
+            uncond_prompt_mask=uncond_prompt_mask,
+            not_apply_cfg_solver=args.not_apply_cfg_solver,
+            distill_cfg=args.distill_cfg,
+            hunyuan_teacher_disable_cfg=args.hunyuan_teacher_disable_cfg,
+            global_step=global_step,
+            text_encoder = text_encoder,
+            writer = writer,
+            num_train_epochs=args.num_train_epochs,
+            num_update_steps_per_epoch=num_update_steps_per_epoch,
+            disc = disc,
+            init_steps=0,
+            progress_bar=progress_bar,
+        )
 
-                    hunyuan_teacher_disable_cfg=args.hunyuan_teacher_disable_cfg,
-                )
 
-            train_loss += loss
-
-            logs = {
-                "loss": loss,
-                "lr": lr_scheduler.get_last_lr()[0],
-                "grad_norm": grad_norm,
-                "step": global_step,
-            }
-            logs.update(model_pred_norm)
-            progress_bar.update(1)
-            progress_bar.set_postfix(**logs)
-
-            if rank <= 0:
-                swanlab.log(logs)
-
-            if args.use_lora and global_step % args.checkpointing_steps == 0:
-                if rank <= 0:
-                    save_lora_checkpoint(
-                        transformer,
-                        optimizer,
-                        args.output_dir,
-                        global_step,
-                    )
-
-            global_step += 1
-
-    destroy_sequence_parallel_group()
+    if get_sequence_parallel_state():
+        destroy_sequence_parallel_group()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--model_type", type=str, default="wan", help="The type of model to train.")
+    parser.add_argument("--model_type", type=str, default="wan_scm", help="The type of model to train.")
 
     # Scheduler
     parser.add_argument('--predict_flow_v', type=bool, default=True,
@@ -483,6 +920,9 @@ if __name__ == "__main__":
                     help='Enable sigma prediction')
     parser.add_argument('--weighting_scheme', type=str, default='logit_normal_trigflow',
                     help='Weighting scheme for timesteps')
+    parser.add_argument('--weighting_scheme_discriminator', type=str, default='logit_normal_trigflow',
+                    help='Weighting scheme for discriminator timesteps')
+    parser.add_argument('--add_noise_timesteps',type=float, nargs='+', default=[1.57080], help='Timesteps for adding noise')
     parser.add_argument('--logit_mean', type=float, default=0.2,
                     help='Mean for logit-normal distribution')
     parser.add_argument('--logit_std', type=float, default=1.6,
@@ -503,19 +943,20 @@ if __name__ == "__main__":
     parser.add_argument("--logvar",type=bool, default=True, help="Whether to use log variance in sCM.")
     parser.add_argument('--class_dropout_prob', type=float, default=0.0,
                    help='Probability of class dropout during training')
-    parser.add_argument('--cfg_scale', type=float, default=5.0,
-                    help='Configuration scale factor')
     parser.add_argument('--cfg_embed', type=bool, default=True,
                     help='Whether to use configuration embedding')
     parser.add_argument('--cfg_embed_scale', type=float, default=0.1,
                     help='Scale factor for configuration embedding')
+    parser.add_argument('--sample_neg_prompt', type=str, default='色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走',
+                   help='sample_neg_prompt')
     
     # sCM   training arguments
-    parser.add_argument('--tangent_warmup_steps', type=int, default=4000,
+    parser.add_argument('--tangent_warmup_steps', type=int, default=1,
                    help='Number of warmup steps for tangent learning')
     parser.add_argument('--scm_cfg_scale', type=float, nargs='+', default=[4.0, 4.5, 5.0],
                     help='Configuration scale values for sCM')
-    
+    parser.add_argument('--scm_loss', type=bool, default=True,
+                    help='Enable SCM loss')
     
     
     # LADD config
@@ -523,15 +964,18 @@ if __name__ == "__main__":
                    help='Enable multi-scale feature for LADD')
     parser.add_argument('--head_block_ids', type=int, nargs='+', default=[2, 8, 14, 19],
                    help='Block IDs for head layers')
+    parser.add_argument('--r1_penalty', type=bool, default=False,
+                   help='Enable R1 penalty')
+    parser.add_argument('--r1_penalty_weight', type=float, default=1.0e-5,
+                   help='Weight for R1 penalty')
+
     
     # LADD training arguments
     parser.add_argument('--adv_lambda', type=float, default=0.5,
                    help='Weight for adversarial loss')
     parser.add_argument('--scm_lambda', type=float, default=1.0,
                     help='Weight for SCM loss')
-    parser.add_argument('--scm_loss', type=bool, default=True,
-                    help='Enable SCM loss')
-    parser.add_argument('--misaligned_pairs_D', type=bool, default=True,
+    parser.add_argument('--misaligned_pairs_D', type=bool, default=False,
                     help='Enable misaligned pairs for discriminator')
     parser.add_argument('--discriminator_loss', type=str, default='hinge',
                     help='Type of discriminator loss')
@@ -541,10 +985,13 @@ if __name__ == "__main__":
                     help='Value of largest timestep')
     parser.add_argument('--largest_timestep_prob', type=float, default=0.5,
                     help='Probability of using largest timestep')
+    parser.add_argument('--diff_timesteps_D', type=bool, default=True,
+                    help='Enable differentiable timesteps for discriminator')
+
     
     
     # dataset & dataloader
-    parser.add_argument("--data_json_path", type=str , default= "/storage/lintaoLab/lintao/botehuang/datasets/webvid-10k/Image-Vid-wan/videos2caption.json")
+    parser.add_argument("--data_json_path", type=str , default= "/run/determined/workdir/data/H800/datasets/webvid-10k/Image-Vid-wan/videos2captionclip.json")
     parser.add_argument("--num_height", type=int, default=480)
     parser.add_argument("--num_width", type=int, default=832)
     parser.add_argument("--num_frames", type=int, default=81)
@@ -560,20 +1007,20 @@ if __name__ == "__main__":
         default=16,
         help="Batch size (per device) for the training dataloader.",
     )
-    parser.add_argument("--num_latent_t", type=int, default=32, help="Number of latent timesteps.")
+    parser.add_argument("--num_latent_t", type=int, default=2, help="Number of latent timesteps.")
     parser.add_argument("--group_frame", action="store_true")  # TODO
     parser.add_argument("--group_resolution", action="store_true")  # TODO
 
     # text encoder & vae & diffusion model
-    parser.add_argument("--pretrained_model_name_or_path", type=str,default=" /storage/lintaoLab/lintao/botehuang/diffusion/models/Wan2.1-T2V-1.3B")
-    parser.add_argument("--dit_model_name_or_path", type=str , default= "/storage/lintaoLab/lintao/botehuang/diffusion/models/Wan2.1-T2V-1.3B")
+    parser.add_argument("--pretrained_model_name_or_path", type=str,default=" /run/determined/workdir/data/H800/diffusion/models/Wan2.1-T2V-1.3B")
+    parser.add_argument("--dit_model_name_or_path", type=str , default= "/run/determined/workdir/data/H800/diffusion/models/Wan2.1-T2V-1.3B")
     parser.add_argument("--cache_dir", type=str, default="./cache_dir")
 
     # diffusion setting
     parser.add_argument("--cfg", type=float, default=0.1)
 
     # validation & logs
-    parser.add_argument("--validation_prompt_dir", type=str, default="/storage/lintaoLab/lintao/botehuang/datasets/webvid-10k/Image-Vid-Finetune-wan/validation")
+    parser.add_argument("--validation_prompt_dir", type=str, default="/run/determined/workdir/data/H800/datasets/webvid-10k/Image-Vid-Finetune-wan/validation")
     parser.add_argument("--validation_sampling_steps", type=str, default="25")
     parser.add_argument("--validation_guidance_scale", type=str, default="4.5")
 
@@ -584,7 +1031,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/storage/lintaoLab/lintao/botehuang/datasets/webvid-10k/outputs/wan-1.3B-1e6-16-latent32",
+        default="/run/determined/workdir/data/H800/datasets/webvid-10k/outputs/adv-1e5-latent2-rejvp-cfg10-norm",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -596,7 +1043,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=160,
+        default=5,
         help=("Save a checkpoint of the training state every X updates. These checkpoints can be used both as final"
               " checkpoints in case they are better than the last checkpoint, and are also suitable for resuming"
               " training using `--resume_from_checkpoint`."),
@@ -629,7 +1076,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max_train_steps",
         type=int,
-        default=320,
+        default=10000,
         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.",
     )
     parser.add_argument(
@@ -641,7 +1088,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-6,
+        default=1e-5,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
@@ -656,7 +1103,7 @@ if __name__ == "__main__":
         default=10,
         help="Number of steps for the warmup in the lr scheduler.",
     )
-    parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
+    parser.add_argument("--max_grad_norm", default=1, type=float, help="Max gradient norm.")
     parser.add_argument(
         "--gradient_checkpointing",
         action="store_true",
@@ -731,9 +1178,8 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to apply the cfg_solver.",
     )
-    parser.add_argument("--distill_cfg", type=float, default=3.0, help="Distillation coefficient.")
+    parser.add_argument("--distill_cfg", type=float, default=10.0, help="Distillation coefficient.")
     # ["euler_linear_quadratic", "pcm", "pcm_linear_qudratic"]
-    parser.add_argument("--scheduler_type", type=str, default="pcm", help="The scheduler type to use.")
     parser.add_argument(
         "--linear_quadratic_threshold",
         type=float,

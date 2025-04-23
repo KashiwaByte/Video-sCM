@@ -27,37 +27,50 @@ class LatentDataset(Dataset):
         # json.load(f) already keeps the order
         # self.data_anno = sorted(self.data_anno, key=lambda x: x['latent_path'])
         self.num_latent_t = num_latent_t
-        # just zero embeddings [512, 4096]
+        # just zero embeddings [256, 4096]
         self.uncond_prompt_embed = torch.zeros(512, 4096).to(torch.float32)
-        # 512 zeros
+        # 256 zeros
         self.uncond_prompt_mask = torch.zeros(512).bool()
         self.lengths = [data_item["length"] if "length" in data_item else 1 for data_item in self.data_anno]
 
     def __getitem__(self, idx):
-        latent_file = self.data_anno[idx]["latent_path"]
-        prompt_embed_file = self.data_anno[idx]["prompt_embed_path"]
-        prompt_attention_mask_file = self.data_anno[idx]["prompt_attention_mask"]
-        # load
-        latent = torch.load(
-            os.path.join(self.latent_dir, latent_file),
-            map_location="cpu",
-            weights_only=True,
-        )
-        latent = latent.squeeze(0)[:, -self.num_latent_t:]
+        max_retries = len(self.data_anno)
+        current_idx = idx
+        for _ in range(max_retries):
+            try:
+                latent_file = self.data_anno[current_idx]["latent_path"]
+                prompt_embed_file = self.data_anno[current_idx]["prompt_embed_path"]
+                prompt_attention_mask_file = self.data_anno[current_idx]["prompt_attention_mask"]
+                # load
+                latent = torch.load(
+                    os.path.join(self.latent_dir, latent_file),
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                latent = latent.squeeze(0)[:, -self.num_latent_t:]
+            except Exception as e:
+                print(f"Error loading latent file {latent_file}: {e}, trying next sample")
+                current_idx = (current_idx + 1) % len(self.data_anno)
+                continue
         if random.random() < self.cfg_rate:
             prompt_embed = self.uncond_prompt_embed
             prompt_attention_mask = self.uncond_prompt_mask
         else:
-            prompt_embed = torch.load(
-                os.path.join(self.prompt_embed_dir, prompt_embed_file),
-                map_location="cpu",
-                weights_only=True,
-            )
-            prompt_attention_mask = torch.load(
-                os.path.join(self.prompt_attention_mask_dir, prompt_attention_mask_file),
-                map_location="cpu",
-                weights_only=True,
-            )
+            try:
+                prompt_embed = torch.load(
+                    os.path.join(self.prompt_embed_dir, prompt_embed_file),
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                prompt_attention_mask = torch.load(
+                    os.path.join(self.prompt_attention_mask_dir, prompt_attention_mask_file),
+                    map_location="cpu",
+                    weights_only=True,
+                )
+            except RuntimeError as e:
+                print(f"Error loading prompt files for {prompt_embed_file}, using uncond embeddings. Error: {e}")
+                prompt_embed = self.uncond_prompt_embed
+                prompt_attention_mask = self.uncond_prompt_mask
         return latent, prompt_embed, prompt_attention_mask
 
     def __len__(self):

@@ -810,7 +810,7 @@ def train(
                             )
                         )
                     )
-                    log_buffer.average()
+                    lor.average()
 
                     current_step = (
                         global_step - sampler.step_start // config.train.train_batch_size
@@ -866,7 +866,7 @@ def train(
                             osp.join(config.work_dir, "checkpoints"),
                             epoch=epoch,
                             model=DiscHeadModel(accelerator.unwrap_model(disc)),
-                            optimizer=optimizer_D,
+                            optimizer=og_buffeptimizer_D,
                             step=global_step,
                             add_suffix=config.train.suffix_checkpoints,
                         )
