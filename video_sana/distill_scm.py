@@ -672,6 +672,8 @@ def main(args):
                             rank,
                             args.output_dir,
                             step=global_step,
+                            use_fsdp = False
+
                         )
                         
 
@@ -692,6 +694,8 @@ def main(args):
                 rank,
                 args.output_dir,
                 args.max_train_steps,
+                use_fsdp = False
+
             )
 
     if get_sequence_parallel_state():

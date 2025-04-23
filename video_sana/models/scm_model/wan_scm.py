@@ -637,12 +637,12 @@ class WanModelSCM(ModelMixin, ConfigMixin):
         pretrain_timestep = t * 1000
 
         # scale input based on timestep
-        t = t.view(-1, 1, 1, 1, 1)
-        scale_factor = torch.sqrt(t**2 + (1 - t) ** 2)
+        t_view = t.view(-1, 1, 1, 1, 1)
+        scale_factor = torch.sqrt(t_view**2 + (1 - t_view) ** 2)
         x = [x_i * scale_factor for x_i in x]
-        x = [x_i.squeeze(0) if x_i.shape[0] == 1 and len(x_i.shape) > 4 else x_i for x_i in x]
+        x_scale = [x_i.squeeze(0) if x_i.shape[0] == 1 and len(x_i.shape) > 4 else x_i for x_i in x]
 
-        t = pretrain_timestep
+        # t = pretrain_timestep
             
     
 
@@ -654,10 +654,10 @@ class WanModelSCM(ModelMixin, ConfigMixin):
             self.freqs = self.freqs.to(device)
 
         if y is not None:
-            x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+            x = [torch.cat([u, v], dim=0) for u, v in zip(x_scale, y)]
 
         # embeddings
-        x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
+        x = [self.patch_embedding(u.unsqueeze(0)) for u in x_scale]
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
@@ -671,7 +671,7 @@ class WanModelSCM(ModelMixin, ConfigMixin):
         # time embeddings
         with amp.autocast(dtype=torch.float32):
             e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t).float())
+                sinusoidal_embedding_1d(self.freq_dim, pretrain_timestep).float())
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
@@ -727,9 +727,11 @@ class WanModelSCM(ModelMixin, ConfigMixin):
         
         # Flow --> TrigFlow Transformation
         # Directly apply TrigFlow transformation regardless of jvp flag
-        trigflow_model_out = [((1 - 2 * t) * x_i + (1 - 2 * t + 2 * t**2) * model_out_i) / torch.sqrt(t**2 + (1 - t) ** 2)
-                             for x_i, model_out_i in zip(x, model_out)]
         
+        trigflow_model_out = [((1 - 2 * t_view) * x_i + (1 - 2 * t_view + 2 * t_view**2) * model_out_i) / torch.sqrt(t_view**2 + (1 - t_view) ** 2)
+                             for x_i, model_out_i in zip(x_scale, model_out)]
+        
+
 
         if return_logvar :
             self.logvar_scale_factor = 1.0

@@ -93,10 +93,14 @@ class WanT2V_SCM:
             device=self.device)
         
 
+
+
         if wanmodel_dir:
             if use_scm:
                 logging.info(f"Creating WanModel_SCM from {wanmodel_dir} ")
-                self.model = WanModelSCM.from_pretrained(wanmodel_dir)
+                self.model = WanModelSCM.from_pretrained(wanmodel_dir,
+                                                      low_cpu_mem_usage=False,
+                                                      device_map=None)
                 logging.info(f"Create WanModel_SCM from wanmodel_dir success")
             else:
                 logging.info(f"Creating WanModel from {wanmodel_dir} ")
@@ -290,9 +294,10 @@ class WanT2V_SCM:
                         return_dict=False,
                         sigma_data=sigma_data,
                         generator=seed_g)[0]
-                    latents = [temp_x0.squeeze(0)]
+                    latents = temp_x0.squeeze(0)
 
-                x0 = [latents[0]/sigma_data] 
+                x0 = [latents[0] / sigma_data] 
+                
                 if offload_model:
                     self.model.cpu()
                     torch.cuda.empty_cache()

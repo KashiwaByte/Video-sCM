@@ -659,6 +659,8 @@ def distill(
                             rank,
                             args.output_dir,
                             args.max_train_steps,
+                            use_fsdp = False
+
                         )
 
 
@@ -1031,7 +1033,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/run/determined/workdir/data/H800/datasets/webvid-10k/outputs/adv-1e5-latent2-rejvp-cfg10-norm",
+        default="/run/determined/workdir/data/H800/datasets/webvid-10k/outputs/adv-1e5-latent2-rejvp-cfg5-norm",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -1178,7 +1180,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Whether to apply the cfg_solver.",
     )
-    parser.add_argument("--distill_cfg", type=float, default=10.0, help="Distillation coefficient.")
+    parser.add_argument("--distill_cfg", type=float, default=5.0, help="Distillation coefficient.")
     # ["euler_linear_quadratic", "pcm", "pcm_linear_qudratic"]
     parser.add_argument(
         "--linear_quadratic_threshold",
