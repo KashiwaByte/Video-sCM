@@ -11,3 +11,7 @@ wheels/
 
 # Gen File
 video_gen/
+
+# log File
+swanlab/
+logs/
